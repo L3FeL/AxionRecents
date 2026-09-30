@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  privapp allowlist for the Axion Launcher3 (com.android.launcher3).
+  Generated from the device's own protection levels: every permission the APK
+  requests whose protectionLevel carries the "privileged" flag MUST be listed
+  here, otherwise ro.control_privapp_permissions=enforce turns it into a boot
+  failure.  signature|recents / signature|role / signature|preinstalled
+  permissions are granted by AOSP itself and are deliberately NOT listed.
+-->
+<permissions>
+    <privapp-permissions package="com.android.launcher3">
+        <permission name="android.permission.ACCESS_CONTEXTUAL_SEARCH"/>
+        <permission name="android.permission.ACCESS_HIDDEN_PROFILES_FULL"/>
+        <permission name="android.permission.ALLOW_SLIPPERY_TOUCHES"/>
+        <permission name="android.permission.BIND_APPWIDGET"/>
+        <permission name="android.permission.BROADCAST_CLOSE_SYSTEM_DIALOGS"/>
+        <permission name="android.permission.CONTROL_REMOTE_APP_TRANSITION_ANIMATIONS"/>
+        <permission name="android.permission.START_TASKS_FROM_RECENTS"/>
+        <permission name="android.permission.STATUS_BAR"/>
+        <permission name="android.permission.STOP_APP_SWITCHES"/>
+        <permission name="android.permission.WRITE_SECURE_SETTINGS"/>
+    </privapp-permissions>
+</permissions>

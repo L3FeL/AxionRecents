@@ -1,0 +1,12 @@
+# 构建产物 / 中间文件
+dist/
+rro/compiled.zip
+rro/*.unsigned
+rro/*.aligned
+*.apk.idsig
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

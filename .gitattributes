@@ -1,0 +1,6 @@
+# Shell scripts must keep LF endings - Android's sh (mksh) fails on CRLF.
+* text=auto eol=lf
+*.png binary
+*.apk binary
+*.jks binary
+*.zip binary

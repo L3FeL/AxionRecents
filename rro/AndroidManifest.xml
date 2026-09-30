@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Static framework RRO overriding exactly one resource:
+  android:string/config_recentsComponentName  ->  Axion's RecentsActivity.
+
+  Mirrors the stock Moto overlay /product/overlay/framework-rro-launcher3.apk
+  (package com.motorola.overlay.launcher3, priority 1).  Ours uses a higher
+  priority so it wins the resource conflict.
+
+  NOTE: the stock Moto overlay is signed with "CN=Common MotoBLUR 2-1-1" while
+  framework-res.apk is signed with "CN=MAP5 Platform 466-1-333" - i.e. a
+  static RRO that is NOT signed with the target's certificate is accepted on
+  this shipping ROM, so a self-signed overlay is fine.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.axion.recents.overlay"
+    android:versionCode="36"
+    android:versionName="16">
+
+    <uses-sdk android:minSdkVersion="36" android:targetSdkVersion="36"/>
+
+    <application
+        android:hasCode="false"
+        android:extractNativeLibs="true"/>
+
+    <overlay
+        android:targetPackage="android"
+        android:isStatic="true"
+        android:priority="100"/>
+</manifest>

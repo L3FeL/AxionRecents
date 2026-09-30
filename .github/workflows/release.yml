@@ -1,0 +1,42 @@
+name: release
+
+# Push a tag like v1.0 and this workflow builds the flashable module zip and
+# attaches it (plus SHA256SUMS.txt) to the GitHub release for that tag.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build flashable zip
+        shell: pwsh
+        run: |
+          ./tools/build-zip.ps1
+          $zip = Get-ChildItem dist/*.zip | Select-Object -First 1
+          "$(Get-FileHash $zip.FullName -Algorithm SHA256 | ForEach-Object { $_.Hash.ToLower() })  $($zip.Name)" |
+            Set-Content -Path dist/SHA256SUMS.txt -Encoding utf8
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AxionRecents-module-zip
+          path: dist/*.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
