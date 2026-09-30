@@ -12,7 +12,7 @@
 > and reboot. Requires root + KernelSU. See [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md) for the
 > mechanism. Licence: GPL-3.0.
 
-**当前版本 v1.0**（首个公开发布版）。模块 ID `axion_recents`。
+**当前版本 v1.0**（首个公开发布版）。模块 ID `axion_recents`，作者 **L3FeL**。
 
 ![堆叠式后台](docs/screenshot.png)
 
@@ -176,3 +176,9 @@ AxionRecents/
 * `payload/AxionLauncher3.apk` 由 **AxionOS / Lawnchair / AOSP Launcher3** 派生的源码构建，
   相应权利归其各自作者；`AxStack*` 堆叠式 Overview 实现来自 AxionOS/Lawnchair 一侧。
 * 感谢 AOSP Launcher3、Lawnchair、AxionOS 以及 KernelSU 生态。
+* **本仓库的代码与文档由 AI 生成**：模块脚本（`customize.sh` / `post-fs-data.sh` / `service.sh` /
+  `boot-completed.sh`）、RRO 源码、`tools/` 构建脚本、README / CHANGELOG / `docs/HOW-IT-WORKS.md`
+  以及 `payload/AxionLauncher3.apk` 里的改动，都是在 AI 编码助手（DeepSeek Harness 中的 agent）协助下
+  写出来的；需求、真机测试、回归验证与最终发布由作者 **L3FeL** 完成。
+  使用前请自行阅读脚本、理解它在你的设备上做了什么（尤其是 priv-app 镜像、HOME 角色交接和
+  静态 RRO 这三件事）。

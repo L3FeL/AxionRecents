@@ -2,5 +2,5 @@ id=axion_recents
 name=Axion Recents (Stacked Overview)
 version=v1.0
 versionCode=1
-author=dsh
+author=L3FeL
 description=Stacked (deck-style) recents for Motorola Android 16. Boot-time tmpfs mirror of an AxionOS/Lawnchair-derived Launcher3 plus a static framework RRO that points config_recentsComponentName at it, with automatic HOME handover and a crash-loop watchdog. Nothing to configure after flashing; to go back to the stock launcher, disable this module in the manager and reboot.
