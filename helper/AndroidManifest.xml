@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.axion.motodesktop"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+
+    <application
+        android:allowBackup="false"
+        android:hasCode="true"
+        android:icon="@android:drawable/sym_def_app_icon"
+        android:label="Axion 桌面桥接">
+
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="让 Moto 启动器作为默认桌面时拿到 recents 标志的系统权限（MANAGE_ACTIVITY_TASKS 等），最近任务仍由 Axion 提供" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="93" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposedscope" />
+    </application>
+</manifest>

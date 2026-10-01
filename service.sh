@@ -116,6 +116,43 @@ watchdog() {
     return 0
 }
 
+# v2.0 C-lite 看门狗：HOME 留在原厂 Moto 桌面，Axion 只当最近任务组件时用。
+# 判据与旧模式不同：
+#   * 两个进程都必须活着 —— Axion 是 QuickStep/recents 提供者（SystemUI 绑它的
+#     TouchInteractionService），原厂桌面是 HOME 持有者（我们的 LSPosed 补丁把
+#     signature|recents 的权限补回给它；补丁没生效时原厂桌面会崩，这就是要看 pid 的原因）。
+#   * 崩溃计数照旧：launcher(Axion) >=2 或 SystemUI >=3 ⇒ 不健康。
+#   * **不** force-stop 原厂桌面 —— C-lite 下它必须活着。
+watchdog_clite() {
+    p0=$(pidof com.android.launcher3); m0=$(pidof com.motorola.launcher3)
+    c0=$(ax_crashes); s0=$(ax_sui_crashes)
+    log "watchdog(c-lite): start (axion=${p0:-none} moto=${m0:-none} launcher_crashes=$c0 systemui_crashes=$s0)"
+    i=0
+    while [ $i -lt 8 ]; do
+        sleep 20
+        i=$((i + 1))
+        p1=$(pidof com.android.launcher3); m1=$(pidof com.motorola.launcher3)
+        c1=$(ax_crashes); s1=$(ax_sui_crashes)
+        log "watchdog(c-lite): t=${i}x20s axion=${p1:-none} moto=${m1:-none} launcher_crashes=$c1 systemui_crashes=$s1"
+        if [ -z "$p1" ]; then
+            log "watchdog(c-lite): UNHEALTHY - the Axion quickstep process is not running"
+            return 1
+        fi
+        if [ -z "$m1" ]; then
+            log "watchdog(c-lite): UNHEALTHY - the stock HOME process is not running"
+            return 1
+        fi
+        if [ "$c1" -ge 2 ] || [ "$s1" -ge 3 ]; then
+            log "watchdog(c-lite): UNHEALTHY - crash loop (launcher=$c1 systemui=$s1)"
+            return 1
+        fi
+    done
+    log "watchdog(c-lite): healthy after $((i * 20))s (axion=${p1:-none} moto=${m1:-none} launcher_crashes=${c1:-0} systemui_crashes=${s1:-0})"
+    date '+%Y-%m-%d %H:%M:%S' > "$HEALTHY"
+    rm -f /data/adb/axion_recents_bootcount /data/adb/axion_recents_rebooted
+    return 0
+}
+
 # v1.9 被动看门狗：探针模式 / SKIP 分支（Axion 不是 HOME 持有者）下用。
 # 这里不期待 launcher 存活，只观察 SystemUI；结论同样写健康标记，否则守卫会把
 # 这次“本来安全的开机”算成失败，下一次就不敢挂载了。
@@ -248,6 +285,48 @@ case "$recents" in
     *)                       rro_eff=0 ;;
 esac
 log "=== HOME role (recents=$recents | staged marker=$rro_ok) ==="
+# v2.0 C-lite 判定：标记 + 实际 HOME 归属。boot-completed.sh 在补丁不生效时会退回旧模式
+# （把 HOME 交给 com.android.launcher3），此时这里必须跟着走旧分支，否则看门狗会误判。
+STOCK_HOME=/data/adb/axion_recents_stock_home
+clite=0
+if [ -f "$STOCK_HOME" ]; then
+    if cmd role get-role-holders --user 0 android.app.role.HOME 2>/dev/null | grep -q com.motorola.launcher3; then
+        clite=1
+    else
+        log "C-LITE marker present but the HOME role is not the stock launcher -> boot-completed fell back to the old mode this boot"
+    fi
+fi
+# v2.0：boot-completed.sh 要带退避地重建原厂桌面进程、确认补丁真的进了进程（最多 12 轮 ≈ 4.4 分钟）
+# 才算把 C-lite 建立起来；而本脚本的健康看门狗跟它的探测循环是**并发**的。早先看门狗只用 160 秒
+# 就判定“原厂桌面没起来”并 ax_rollback（写 disable + 自动重启），把还没跑完的探测直接打断 —— 18:45
+# 那次开机就是这么挂的。所以先等 boot-completed settle（CLITE_STATE 写成 ok / failed），最多等 5 分钟。
+CLITE_STATE=/data/adb/axion_recents_clite_state
+if [ "$clite" = "1" ]; then
+    w=0
+    while [ "$w" -lt 20 ]; do
+        case "$(cat "$CLITE_STATE" 2>/dev/null)" in
+            ok*)
+                log "C-LITE settle: boot-completed finished the switch ($(cat "$CLITE_STATE" 2>/dev/null))"
+                break
+                ;;
+            failed)
+                log "C-LITE settle: boot-completed reported failure -> old mode"
+                clite=0
+                break
+                ;;
+        esac
+        if ! cmd role get-role-holders --user 0 android.app.role.HOME 2>/dev/null | grep -q com.motorola.launcher3; then
+            log "C-LITE settle: HOME role is no longer the stock launcher -> boot-completed fell back to the old mode"
+            clite=0
+            break
+        fi
+        sleep 15
+        w=$((w + 1))
+    done
+    if [ "$clite" = "1" ] && [ "$w" -ge 20 ]; then
+        log "C-LITE WARN: boot-completed did not settle within 300s (state: $(cat "$CLITE_STATE" 2>/dev/null)) - the watchdog will judge as-is"
+    fi
+fi
 # 回原厂桌面的唯一办法是在 KernelSU 里停用本模块：那样本脚本不会运行、我们的 RRO 也不存在，
 # PMS 会把 recents 组件还给 com.motorola.launcher3。
 if [ "$rro_eff" != "1" ]; then
@@ -256,6 +335,22 @@ if [ "$rro_eff" != "1" ]; then
     log "HOME  : $(cmd role get-role-holders --user 0 android.app.role.HOME 2>&1 | tr '\n' ' ')"
     rm -f "$HOME_GRANTED"   # v1.10: HOME was never taken this boot - no stale marker
     log "done"
+elif [ "$clite" = "1" ]; then
+    log "=== C-LITE: HOME stays with the stock launcher, Axion provides the recents ==="
+    # 判据不能用 dumpsys：recents 标志权限的放行发生在运行期（AMS/ATMS 的 checkPermission 漏斗），
+    # dumpsys 只反映开机扫描时的清单授权，`MANAGE_ACTIVITY_TASKS: granted=true` 永远不会出现
+    # （v2.0 实测踩过）。这里改成看补丁自己打的运行期日志。
+    granted=$(logcat -d -s AXMOTO 2>/dev/null | grep -c granted)
+    log "  LSPosed patch effect (AXMOTO runtime grant lines): $granted"
+    log "  HOME      : $(cmd role get-role-holders --user 0 android.app.role.HOME 2>&1 | tr '\n' ' ')"
+    log "  pids      : axion=$(pidof com.android.launcher3) moto=$(pidof com.motorola.launcher3)"
+    log "  bound     : $(dumpsys activity services com.android.quickstep.TouchInteractionService 2>/dev/null | grep -cE 'c:com.android.systemui') systemui client(s) on a quickstep service"
+    if [ "$granted" -lt 1 ]; then
+        log "WARN: no AXMOTO grant lines in logcat (the ring buffer may just have rotated; boot-completed"
+        log "      verified the patch functionally before leaving C-lite mode - check /data/adb/lspd/log if worried)"
+    fi
+    rm -f "$HOME_GRANTED"
+    log "done (c-lite)"
 else
     log "before: $(cmd role get-role-holders --user 0 android.app.role.HOME 2>&1 | tr '\n' ' ')"
     rm -f "$HOME_GRANTED"
@@ -309,7 +404,17 @@ elif [ -f "$HOME_GRANTED" ] && [ -n "$(pidof com.android.launcher3)" ]; then
     log "watchdog: 'cmd role' unavailable (system_server restarting) but $HOME_GRANTED is set and our launcher is running -> treating Axion as the HOME holder"
     ax_is_home=1
 fi
-if [ "$ax_is_home" = "1" ]; then
+# v2.0 C-lite：HOME 留在原厂桌面，Axion 只当 recents —— 判据是“两个进程都活着 + 没有崩溃循环”，
+# 绝不 force-stop 原厂桌面；失败时照旧全量回滚（还原原厂 HOME、disable、重启）。
+if [ "$clite" = "1" ]; then
+    log "=== crash-loop watchdog (c-lite: HOME = com.motorola.launcher3, Axion = recents, 160s window) ==="
+    if watchdog_clite; then
+        dump_diag "c-lite watchdog healthy"
+    else
+        dump_diag "c-lite watchdog unhealthy"
+        ax_rollback
+    fi
+elif [ "$ax_is_home" = "1" ]; then
     log "=== crash-loop watchdog (HOME holder = com.android.launcher3, 160s window) ==="
     if watchdog; then
         dump_diag "watchdog healthy"

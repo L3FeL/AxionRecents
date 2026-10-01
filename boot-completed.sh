@@ -63,6 +63,95 @@ if [ "$rro_eff" != "1" ]; then
     exit 0
 fi
 
+# --- v2.0 C-lite 模式：原厂 Moto 桌面保留 HOME，Axion 只提供最近任务 --------------------
+# 标记：/data/adb/axion_recents_stock_home（存在即启用本模式）
+#
+# 为什么必须配一个 LSPosed 补丁：我们的静态 RRO 把 config_recentsComponentName 指到
+# com.android.launcher3 之后，PMS 只把带 recents 保护标志的权限（MANAGE_ACTIVITY_TASKS /
+# REMOVE_TASKS / ROTATE_SURFACE_FLINGER …）授给"recents 包"⇒ 原厂 com.motorola.launcher3
+# 失去它们，它的 QuickstepLauncher 一启动就在 RecentsAnimationDeviceState.<init> 抛
+# SecurityException（v1.2 真机实测的崩溃循环）。补丁模块 com.axion.motodesktop 在
+# system_server 里按 uid 把这些权限补回给原厂桌面（hook PermissionManagerServiceImpl.
+# shouldGrantPermissionByProtectionFlags）。原厂桌面还有第二处崩溃：它用 application context
+# 预热 task view pool，Android 12+ 的 ContextImpl.getDisplay() 对非视觉 context 直接抛
+# UnsupportedOperationException ⇒ FATAL EXCEPTION: ViewPool-init（TaskThumbnailView）⇒ 崩溃循环；
+# 补丁在应用进程里挂 android.app.ContextImpl#getDisplay 兜底返回默认显示器。
+# 所以本模式**必须**先确认补丁真的生效。判据不能用 dumpsys：
+#   recents 标志权限的放行发生在运行期（AMS/ATMS 的 checkPermission 漏斗），dumpsys 只反映
+#   开机扫描时的清单授权，`MANAGE_ACTIVITY_TASKS: granted=true` 永远不会出现（v2.0 实测踩过）。
+# 改用功能性探测：把 HOME 交给原厂桌面 → 看它的主进程是否稳定存活 + 拿到焦点 + 没有新崩溃。
+# 不生效就退回旧行为（把 HOME 交给 com.android.launcher3），保证设备可用。
+STOCK_HOME=/data/adb/axion_recents_stock_home
+HEALTHY=/data/adb/axion_recents_healthy
+BOOTCOUNT=/data/adb/axion_recents_bootcount
+CLITE_STATE=/data/adb/axion_recents_clite_state
+PATCH_PKG=com.axion.motodesktop
+if [ -f "$STOCK_HOME" ]; then
+    log "C-LITE MODE ($STOCK_HOME): the stock Moto launcher keeps HOME, Axion only serves recents"
+    # 告诉 service.sh“切换正在进行”，别让它的健康看门狗在这里还没 settle 时就抢跑回滚（v2.0 踩过：
+    # 看门狗 160 秒就下结论，而本探测最多要 12 轮 ≈ 4.4 分钟）。
+    echo pending > "$CLITE_STATE"
+    rm -f /data/adb/axion_recents_stock_home_kept
+    APK_PATH=$(pm path $PATCH_PKG 2>/dev/null | head -1 | cut -d: -f2)
+    log "  patch apk : $APK_PATH"
+    # LSPosed 的 modules_config.db 是二进制 sqlite：只在里面找“我们这条 apk_path 是否还在”。
+    # （早先用 `grep -ao '/data/app/[^"]*motodesktop[^"]*base\.apk'` 抽路径，DB 里没有 `"` 字节，
+    #   匹配会一路吃到后续记录的二进制垃圾 ⇒ 每次都误报“路径已过期”。）
+    if [ -n "$APK_PATH" ] && ! grep -aq "$APK_PATH" /data/adb/lspd/config/modules_config.db 2>/dev/null; then
+        log "  WARNING: LSPosed 记的模块路径已过期（它会静默跳过该模块，权限/显示补丁都不生效）"
+        log "           处理：在 LSPosed 管理器里把 $PATCH_PKG 关掉再打开，或重跑安装脚本"
+    fi
+    log "  recents   : $recents"
+    log "  pm enable moto: $(pm enable com.motorola.launcher3 2>&1 | tr '\n' ' ')"
+    if ! cmd role get-role-holders --user 0 android.app.role.HOME 2>/dev/null | grep -q com.motorola.launcher3; then
+        log "  HOME -> moto : $(cmd role add-role-holder --user 0 android.app.role.HOME com.motorola.launcher3 2>&1)"
+    fi
+    # 关键（v2.0 实测）：LSPosed 的模块注入在开机后有一段时间不可用 —— 开机早期由系统自己拉起的
+    # 原厂桌面进程拿不到补丁（18:26 / 18:31 两次 patch_loaded=0），同一开机晚些再重建进程就稳定拿到
+    # （18:30 实测 AXMOTO 31 行、18:36 实测 2 行 + granted 行）。已经存在的进程不会补挂模块，
+    # 所以只能"重建进程 + 检查补丁是否真的进了进程"这样带退避地重试，直到成功或超预算。
+    # 每次重试前清一次 crash 缓冲：只统计本次重建之后的崩溃（开机早期原厂桌面可能已经在崩）。
+    moto_ok=0
+    i=1
+    while [ "$i" -le 12 ]; do
+        am force-stop com.motorola.launcher3 >/dev/null 2>&1
+        logcat -b crash -c 2>/dev/null
+        sleep 2
+        # 显式启动原厂桌面的 activity（不依赖 HOME 解析），再补一个 HOME intent。
+        am start -n com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher >/dev/null 2>&1
+        am start -a android.intent.action.MAIN -c android.intent.category.HOME >/dev/null 2>&1
+        sleep 5
+        p2=$(pidof com.motorola.launcher3)
+        focused=$(dumpsys window 2>/dev/null | grep -c 'mCurrentFocus=.*com.motorola.launcher3')
+        crashes=$(logcat -d -b crash 2>/dev/null | grep -c 'com.motorola.launcher3')
+        axmoto=$(logcat -d -s AXMOTO 2>/dev/null | grep -c 'module loaded pkg=com.motorola.launcher3')
+        log "  probe #$i : moto pid=$p2 focused=$focused crashes=$crashes patch_loaded=$axmoto uptime=$(cut -d. -f1 /proc/uptime)s"
+        if [ -n "$p2" ] && [ "$focused" -ge 1 ] && [ "$crashes" -eq 0 ] && [ "$axmoto" -ge 1 ]; then
+            moto_ok=1
+            break
+        fi
+        i=$((i + 1))
+        sleep 15
+    done
+    if [ "$moto_ok" = "1" ]; then
+        log "  HOME after   : $(cmd role get-role-holders --user 0 android.app.role.HOME 2>&1 | tr '\n' ' ')"
+        log "  pids         : axion=$(pidof com.android.launcher3) moto=$(pidof com.motorola.launcher3)"
+        date '+%Y-%m-%d %H:%M:%S' > /data/adb/axion_recents_stock_home_kept
+        rm -f /data/adb/axion_recents_home_granted
+        # 探测已经功能性验证过（原厂桌面主进程稳定 + 有焦点 + 没有新崩溃），等于本开机是健康的：
+        # 立刻补上健康标记，否则 post-fs-data 的崩溃守卫会把"还没等到 service.sh 看门狗写标记的正常开机"
+        # 判成失败，连续两次就 touch disable 停用整个模块（v2.0 重启验证踩过这个坑）。
+        date '+%Y-%m-%d %H:%M:%S' > "$HEALTHY"
+        rm -f "$BOOTCOUNT" /data/adb/axion_recents_rebooted
+        echo "ok $(date '+%Y-%m-%d %H:%M:%S')" > "$CLITE_STATE"
+        log "done (c-lite: HOME untouched, recents = com.android.launcher3, healthy marker written)"
+        exit 0
+    fi
+    echo failed > "$CLITE_STATE"
+    log "  PATCH NOT EFFECTIVE or stock launcher unstable -> falling back to the old behaviour (hand HOME to com.android.launcher3)"
+    log "  check that LSPosed has $PATCH_PKG enabled with the system framework in scope"
+fi
+
 # v1.10：接管前后各停一次原厂 com.motorola.launcher3。
 # 根因更正（v1.10 离线字节码复核）：v1.9 曾把 SystemUI 的气泡 NPE 归因于原厂桌面的
 # moveDraggedBubbleToFullscreen 客户端调用，**这个结论是错的** —— 真正的触发者是我们自己的

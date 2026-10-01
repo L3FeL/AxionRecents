@@ -9,6 +9,10 @@
 #   * Entry names must use forward slashes.  Compress-Archive emits "payload\X.apk" on
 #     Windows, but the Android-side unzip in the installer expects ZIP-spec names, so
 #     the entries are written by hand through ZipArchive.
+#   * extras/ carries what the C-lite mode needs but the module cannot install itself:
+#     the companion LSPosed bridge APK (built by helper/build-helper.ps1, tracked in the
+#     repo so CI ships the same binary) and the C-LITE.md install guide.  After flashing,
+#     they live in /data/adb/modules/axion_recents/extras/.
 #
 # Usage:  pwsh -File tools/build-zip.ps1
 # Output: dist/AxionRecents-v<version>.zip (size + SHA-256 printed)
@@ -31,7 +35,7 @@ if (-not $version) { throw 'no version= line in module.prop' }
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) "axion-zip-stage-$version"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Path (Join-Path $stage 'payload') -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $stage 'system\product\overlay') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $stage 'system/product/overlay') -Force | Out-Null
 
 # Root scripts + module.prop: everything the manager needs at the top level.
 foreach ($f in 'module.prop', 'customize.sh', 'post-fs-data.sh', 'service.sh', 'boot-completed.sh') {
@@ -44,7 +48,17 @@ Get-ChildItem (Join-Path $root 'payload') -File | ForEach-Object {
 }
 
 # system/product/overlay/: the magic-mount source for the static RRO.
-Copy-Item (Join-Path $root 'payload\AxionRecentsOverlay.apk') (Join-Path $stage 'system\product\overlay\AxionRecentsOverlay.apk') -Force
+Copy-Item (Join-Path $root 'payload/AxionRecentsOverlay.apk') (Join-Path $stage 'system/product/overlay/AxionRecentsOverlay.apk') -Force
+
+# extras/: companion LSPosed bridge APK (C-lite mode) + its install guide.
+# Child paths use forward slashes so the script also runs on the CI runner (Linux pwsh).
+$helperApk = Join-Path $root 'helper/dist/motodesktop-helper.apk'
+if (-not (Test-Path $helperApk)) {
+    throw "helper/dist/motodesktop-helper.apk is missing - run helper/build-helper.ps1 first (C-lite needs it)"
+}
+New-Item -ItemType Directory -Path (Join-Path $stage 'extras') -Force | Out-Null
+Copy-Item $helperApk (Join-Path $stage 'extras/motodesktop-helper.apk') -Force
+Copy-Item (Join-Path $root 'docs/C-LITE.md') (Join-Path $stage 'extras/C-LITE.md') -Force
 
 New-Item -ItemType Directory -Path $dist -Force | Out-Null
 $zip = Join-Path $dist "AxionRecents-$version.zip"
@@ -81,10 +95,13 @@ try {
     if ($rro.Length -ne 8339) { throw "RRO is $($rro.Length) bytes, post-fs-data.sh expects 8339" }
     foreach ($need in 'module.prop', 'customize.sh', 'post-fs-data.sh', 'service.sh', 'boot-completed.sh',
                       'payload/AxionLauncher3.apk', 'payload/AxionRecentsOverlay.apk',
-                      'payload/privapp-permissions-com.android.launcher3.xml') {
+                      'payload/privapp-permissions-com.android.launcher3.xml',
+                      'extras/motodesktop-helper.apk', 'extras/C-LITE.md') {
         if (-not ($z.Entries | Where-Object { $_.FullName -eq $need })) { throw "$need missing from the zip" }
     }
-    Write-Host ("checked {0} entries, RRO present at {1} bytes" -f $z.Entries.Count, $rro.Length)
+    $helper = $z.Entries | Where-Object { $_.FullName -eq 'extras/motodesktop-helper.apk' }
+    if ($helper.Length -ne (Get-Item $helperApk).Length) { throw 'extras/motodesktop-helper.apk is not the built helper' }
+    Write-Host ("checked {0} entries, RRO present at {1} bytes, helper {2} bytes" -f $z.Entries.Count, $rro.Length, $helper.Length)
 } finally {
     $z.Dispose()
 }

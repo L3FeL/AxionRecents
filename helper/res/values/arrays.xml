@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="xposedscope">
+        <!-- LSPosed scope the module declares. Only these two are needed:
+             * android                = the system framework (system_server). The bridge hooks
+                                        ActivityManagerService#checkComponentPermission there to
+                                        hand the "recents" permission over to the stock launcher.
+             * com.motorola.launcher3 = the stock Moto launcher process, where the
+                                        ContextImpl#getDisplay fallback keeps QuickStep from
+                                        crashing while creating its task views.
+             LSPosed canonicalises the "android" entry to the framework scope row ("system"). -->
+        <item>android</item>
+        <item>com.motorola.launcher3</item>
+    </string-array>
+</resources>

@@ -9,10 +9,27 @@
 > system priv-app, ships a static framework RRO that redirects `config_recentsComponentName` to it,
 > and hands over the HOME role at boot (with a boot-loop guard and a crash-loop watchdog).
 > Flash the zip in the manager, reboot, done. To return to the stock launcher: disable the module
-> and reboot. Requires root + KernelSU. See [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md) for the
-> mechanism. Licence: GPL-3.0.
+> and reboot. Since v1.1 there is also an optional **C-lite** mode (a flag file plus the companion
+> LSPosed bridge shipped in `extras/`) that keeps the stock Moto launcher as HOME and only swaps the
+> recents for the Axion stack — see [`docs/C-LITE.md`](docs/C-LITE.md). Requires root + KernelSU.
+> See [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md) for the mechanism. Licence: GPL-3.0.
 
-**当前版本 v1.0**（首个公开发布版）。模块 ID `axion_recents`，作者 **L3FeL**。
+**当前版本 v1.1**（v1.0 之后加入 C-lite 模式与配套 LSPosed 桥接模块）。模块 ID `axion_recents`，作者 **L3FeL**。
+
+> **两种桌面模式**（同一个模块，靠标记文件切换）
+>
+> | 模式 | 标记文件 | HOME | 最近任务 |
+> | --- | --- | --- | --- |
+> | 默认（下文描述的行为） | — | Axion（`com.android.launcher3`） | Axion 堆叠式 |
+> | **C-lite** | `/data/adb/axion_recents_stock_home` | 原厂 Moto（`com.motorola.launcher3`） | Axion 堆叠式 |
+>
+> C-lite = **原厂桌面照用，只把最近任务换成 Axion**。它额外需要一个 LSPosed 模块
+> （`moto-desktop-helper`）替原厂桌面补上 `recents` 标志权限，因为 AOSP 只把
+> `MANAGE_ACTIVITY_TASKS` 这类权限授予 `config_recentsComponentName` 指向的包；
+> 该 LSPosed 模块声明（`xposedscope`）里只有两个作用域：`android`（系统框架 = system_server）
+> 与 `com.motorola.launcher3`（原厂桌面进程），其余应用都不需要。
+> C-lite 下**桌面本身不会出现在最近任务里**（只显示真实应用的任务卡）。
+> 安装、验证、代价与回滚见 [`docs/C-LITE.md`](docs/C-LITE.md)。
 
 ![堆叠式后台](docs/screenshot.png)
 
@@ -47,7 +64,7 @@
 
 ## 3. 安装
 
-1. 从本仓库的 **Releases** 页面下载 `AxionRecents-v1.0.zip`（并核对 sha256）。
+1. 从本仓库的 **Releases** 页面下载 `AxionRecents-v1.1.zip`（并核对 sha256）。
 2. KernelSU 管理器 → **模块** → **从本地安装** → 选择该 zip → 重启。
 3. 重启后约 1 分钟，模块会自己做完自检。**务必等它通过再动手**：
 
@@ -64,6 +81,33 @@
 
 > 上滑触发的是系统手势（`OtherActivityInputConsumer`），Quickstep 的既有手势都能用，
 > 不需要额外设置。
+
+### 想让原厂桌面留着？（C-lite：原厂桌面 + Axion 最近任务）
+
+不想换桌面、只想要堆叠式最近任务，就从 v1.1 起用 **C-lite** 模式：
+
+1. 安装配套 LSPosed 桥接（刷入模块后它就在设备上：`/data/adb/modules/axion_recents/extras/motodesktop-helper.apk`）：
+
+   ```bash
+   adb push motodesktop-helper.apk /data/local/tmp/
+   adb shell su -c 'pm install -r /data/local/tmp/motodesktop-helper.apk'
+   ```
+
+   **必须用经典 `pm install`，不要用 `adb install`（incremental）**：incremental 的
+   `/data/app/~~…==/…/base.apk` 路径每次重启会变，而 LSPosed 数据库记的是绝对路径，
+   对不上它会**静默跳过**整个模块（`logcat -s AXMOTO` 一行都没有）。
+
+2. LSPosed 管理器里启用「Axion 桌面桥接」，作用域只勾
+   `系统框架 system` 与 `Moto 应用启动器 com.motorola.launcher3`（详情页里这两行会标「推荐应用」）。
+3. 开标记并重启：
+
+   ```bash
+   adb shell su -c 'touch /data/adb/axion_recents_stock_home'
+   adb shell su -c 'reboot'
+   ```
+
+回到默认模式：`su -c 'rm -f /data/adb/axion_recents_stock_home'` 后重启。
+为什么必须装那个桥接、开机流程、验证命令与回滚，见 [`docs/C-LITE.md`](docs/C-LITE.md)。
 
 ## 4. 回原厂桌面 / 卸载
 
@@ -136,10 +180,14 @@ recents 组件与 `MANAGE_ACTIVITY_TASKS` 都留在 `com.motorola.launcher3`，H
 
 ```powershell
 # 打包可刷写的 zip（版本号取自 module.prop）→ dist\AxionRecents-v<version>.zip
+# zip 里会带上 extras\（C-lite 用的 LSPosed 桥接 APK + C-LITE.md 安装指南）
 pwsh -File tools\build-zip.ps1
 
 # 重新编译 + 签名静态 RRO（需要 Android SDK build-tools 36 + JDK；输出到 payload/）
 pwsh -File tools\build-rro.ps1 -SdkRoot "$env:ANDROID_SDK_ROOT"
+
+# 重新编译 + 签名配套 LSPosed 桥接（输出到 helper/dist/，release zip 从那里取）
+pwsh -File helper\build-helper.ps1 -SdkRoot "$env:ANDROID_SDK_ROOT" -JdkHome "$env:JAVA_HOME"
 ```
 
 `payload/AxionLauncher3.apk` 是预编译产物（来自 AxionOS/Lawnchair 派生的 Launcher3 源码，
@@ -153,11 +201,20 @@ AxionRecents/
 ├── customize.sh                    # 刷入钩子：chmod + chcon
 ├── post-fs-data.sh                 # 目录级 tmpfs 镜像 + 开机计数 / 熔断闸口
 ├── service.sh                      # 开机自检、RRO 生效判定、HOME 交接、崩溃循环看门狗
-├── boot-completed.sh               # 开机完成后再确认一次并交接 HOME
+├── boot-completed.sh               # 开机完成后再确认一次并交接 HOME（含 C-lite 分支）
 ├── payload/
 │   ├── AxionLauncher3.apk          # 被打进 /system_ext/priv-app 的 Axion 桌面（com.android.launcher3）
 │   ├── AxionRecentsOverlay.apk     # 静态框架 RRO（只改 config_recentsComponentName）
 │   └── privapp-permissions-com.android.launcher3.xml
+├── helper/                         # 配套 LSPosed 桥接模块（C-lite 用，GPL-3.0 源码）
+│   ├── AndroidManifest.xml         # xposedmodule 元数据 + xposedscope 声明
+│   ├── java/com/axion/motodesktop/Main.java   # 两处 hook：权限放行 + getDisplay 兜底
+│   ├── res/values/arrays.xml       # 声明作用域：android + com.motorola.launcher3
+│   ├── stubs/                      # LSPosed 编译期接口（只用于编译，不额外打包）
+│   ├── keystore/axion-moto.jks     # 桥接 APK 的签名密钥（重建后仍可覆盖安装）
+│   ├── dist/motodesktop-helper.apk # 预编译产物，release zip 的 extras/ 就是从它来的
+│   ├── build-helper.ps1            # 用它重建上面的 APK
+│   └── README.md
 ├── rro/                            # RRO 源码（AndroidManifest.xml + res/values/strings.xml）
 ├── tools/
 │   ├── build-zip.ps1               # 打包可刷写 zip
@@ -165,10 +222,14 @@ AxionRecents/
 │   └── axion-recents.jks           # RRO 签名用的密钥（签名无需与目标一致，见 docs/HOW-IT-WORKS.md）
 ├── docs/
 │   ├── HOW-IT-WORKS.md             # 原理（RRO / tmpfs 镜像 / HOME 交接 / binder 回调）
+│   ├── C-LITE.md                   # C-lite 模式：原理、安装、开机流程、验证、回滚
 │   └── screenshot.png
 ├── CHANGELOG.md
 └── LICENSE                         # GPL-3.0
 ```
+
+模块 zip 内的 `extras/`（刷入后位于 `/data/adb/modules/axion_recents/extras/`）：
+`motodesktop-helper.apk`（C-lite 的桥接）与 `C-LITE.md`（安装指南）。
 
 ## 10. 许可 / 致谢
 
@@ -177,8 +238,9 @@ AxionRecents/
   相应权利归其各自作者；`AxStack*` 堆叠式 Overview 实现来自 AxionOS/Lawnchair 一侧。
 * 感谢 AOSP Launcher3、Lawnchair、AxionOS 以及 KernelSU 生态。
 * **本仓库的代码与文档由 AI 生成**：模块脚本（`customize.sh` / `post-fs-data.sh` / `service.sh` /
-  `boot-completed.sh`）、RRO 源码、`tools/` 构建脚本、README / CHANGELOG / `docs/HOW-IT-WORKS.md`
-  以及 `payload/AxionLauncher3.apk` 里的改动，都是在 AI 编码助手（DeepSeek Harness 中的 agent）协助下
-  写出来的；需求、真机测试、回归验证与最终发布由作者 **L3FeL** 完成。
-  使用前请自行阅读脚本、理解它在你的设备上做了什么（尤其是 priv-app 镜像、HOME 角色交接和
-  静态 RRO 这三件事）。
+  `boot-completed.sh`）、RRO 源码、配套 LSPosed 桥接（[`helper/`](helper/)，含 `Main.java`）、
+  `tools/` 与 `helper/` 里的构建脚本、README / CHANGELOG / `docs/C-LITE.md` /
+  `docs/HOW-IT-WORKS.md` 以及 `payload/AxionLauncher3.apk` 里的改动，都是在 AI 编码助手
+  （DeepSeek Harness 中的 agent）协助下写出来的；需求、真机测试、回归验证与最终发布由作者
+  **L3FeL** 完成。使用前请自行阅读脚本、理解它在你的设备上做了什么（尤其是 priv-app 镜像、
+  HOME 角色交接、静态 RRO 这三件事，以及 C-lite 模式依赖的 LSPosed 权限 hook）。

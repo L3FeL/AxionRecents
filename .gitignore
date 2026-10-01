@@ -1,5 +1,11 @@
 # 构建产物 / 中间文件
 dist/
+# ... but helper/dist/ ships the prebuilt LSPosed bridge APK: build-zip.ps1 packages it
+# into extras/ and CI needs it in the repo (the directory has to be re-included first,
+# git cannot re-include a file whose parent directory is excluded).
+!helper/dist/
+!helper/dist/*.apk
+helper/build/
 rro/compiled.zip
 rro/*.unsigned
 rro/*.aligned

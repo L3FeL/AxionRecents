@@ -1,0 +1,219 @@
+# C-lite 模式：原厂桌面 + Axion 最近任务
+
+> 目标（用户口径）：**桌面用 Moto 自带的（`com.motorola.launcher3`），最近任务用本模块带进来的 Axion 堆叠式**
+> （`com.android.launcher3`）。两个包名不同，可以共存。
+
+本模块有两种模式，靠一个标记文件切换：
+
+| 模式 | 标记文件 | HOME | 最近任务 |
+| --- | --- | --- | --- |
+| 默认（v1.0 行为） | 不存在 | `com.android.launcher3`（Axion） | Axion |
+| **C-lite** | `/data/adb/axion_recents_stock_home` 存在 | `com.motorola.launcher3`（原厂） | Axion |
+
+RRO 与 priv-app 镜像两种模式都一样：`config_recentsComponentName` 始终指向
+`com.android.launcher3/com.android.quickstep.RecentsActivity`。
+
+## 1. 为什么需要那个 LSPosed 模块
+
+Android 16 里带 `recents` 标志的权限（`MANAGE_ACTIVITY_TASKS` = `signature|recents`、
+`REMOVE_TASKS` = `signature|recents|role`、`ROTATE_SURFACE_FLINGER` = `signature|recents` …）
+**只授予 `config_recentsComponentName` 指向的那个包**，判定点在
+`PermissionManagerServiceImpl.shouldGrantPermissionByProtectionFlags`
+（`bp.isRecents() && getKnownPackageNames(PACKAGE_RECENTS)`）。
+
+C-lite 下 HOME 是 Moto，但 recents 组件是 Axion ⇒ Moto 拿不到这些权限，一起手就崩：
+
+```
+FATAL EXCEPTION: main
+java.lang.RuntimeException: Unable to start activity ...QuickstepLauncher:
+  java.lang.SecurityException: Permission Denial: getRootTaskInfo() from pid=…, uid=10266
+  requires android.permission.MANAGE_ACTIVITY_TASKS
+  at com.android.quickstep.RecentsAnimationDeviceState.<init>(…:263)
+```
+
+`privapp-permissions-*.xml` 白名单**没用**（白名单只对带 `privileged` 标志的权限生效），
+`pm grant` 也没用（`not a changeable permission type`）。所以只能由 **LSPosed 模块在
+system_server 里把这个判定改掉**：`moto-desktop-helper` 挂
+`ActivityManagerService.checkComponentPermission` / `checkPermission` /
+`enforceCallingPermission` 与 `PermissionManagerServiceImpl.shouldGrantPermissionByProtectionFlags`，
+对 uid = `com.motorola.launcher3` 判为已授予。
+
+它同时兜住第二处崩溃（Moto 用 application context 预热 task view pool）：
+
+```
+UnsupportedOperationException: Tried to obtain display from a Context not associated with one
+  ← ContextImpl.getDisplay ← ScreenDecorationsUtils.getPhysicalPixelDisplaySizeRatio
+  ← QuickStepContract.getWindowCornerRadius ← TaskView$FullscreenDrawParams.<init>
+```
+
+⇒ 模块同时 hook `android.app.ContextImpl#getDisplay`，只在该异常上返回默认显示器
+（返回的 display 只用来算圆角半径，属外观量）。
+
+## 2. 安装
+
+前提：KernelSU（本模块，v1.1+）+ LSPosed（Zygisk Next 版本即可）。
+
+桥接 APK 随模块 zip 分发：刷入后它就在设备上
+`/data/adb/modules/axion_recents/extras/motodesktop-helper.apk`（仓库里是
+[`helper/`](../helper/)，可用 `helper/build-helper.ps1` 重建）：
+
+```bash
+adb push motodesktop-helper.apk /data/local/tmp/      # 从 extras/ 里取出
+adb shell su -c 'pm install -r /data/local/tmp/motodesktop-helper.apk'
+```
+
+也可以手工照下面做（这里记录的是开发机上的一键脚本，做的正是下面 1–3 步）：
+
+```powershell
+pwsh -NoProfile -File 'D:\Download\dsh\_tools\_clite_install.ps1'
+# 然后重启
+adb -s <serial> reboot
+```
+
+脚本做的事：
+
+1. `adb push motodesktop-helper.apk /data/local/tmp/` → `su -c "pm install -r /data/local/tmp/motodesktop-helper.apk"`。
+   **必须用经典 `pm install`，不要用 `adb install`（incremental）**：incremental 的
+   `/data/app/~~…==/…/base.apk` 路径重启后会变，而 LSPosed 数据库里记的是绝对路径，
+   路径对不上它会**静默跳过**整个模块（`logcat -s AXMOTO` 一行都没有）。
+2. 读 `pm path com.axion.motodesktop`，把设备上的
+   `/data/adb/lspd/config/modules_config.db` 拉回主机，写入
+   `modules_state('com.axion.motodesktop', user 0, enabled=1)`、
+   `scope('…','system',0)`、`scope('…','com.motorola.launcher3',0)` 与正确的 `apk_path`，
+   再推回设备（chown 0:0 / chmod 600，删掉 `-wal`/`-shm`）。
+   系统框架在 LSPosed 数据库里存的 scope 名是 **`system`**（`scope('…','system',0)`），
+   但模块 APK 里**声明**（`xposedscope`）的是 `android` —— 这是 LSPosed 上游约定
+   （`com.drdisagree.iconify` 声明 `["android","com.android.systemui"]`、
+   `com.jozein.xedgepro` 声明 `["android"]`，它们的数据库 scope 行同样落成 `system`），
+   核心会把 `android` 规范化成框架 scope。声明里**只有两个**条目：
+   `android`（系统框架 = system_server 里的权限放行 hook）+ `com.motorola.launcher3`
+   （原厂桌面进程里的 `ContextImpl#getDisplay` 兜底），其余应用一个都不需要。
+3. `touch /data/adb/axion_recents_stock_home`（开 C-lite），并清掉守卫用的
+   `/data/adb/axion_recents_bootcount` 与 `/data/adb/modules/axion_recents/disable`。
+
+## 3. 开机会发生什么
+
+1. `post-fs-data.sh`：magic mount priv-app 镜像 + 权限白名单 + 静态 RRO；
+   并清掉 `/data/adb/axion_recents_clite_state`（本次开机的 C-lite settle 状态）。
+2. `boot-completed.sh`（C-lite 分支）：
+   * 把 settle 状态写成 `pending`（`echo pending > /data/adb/axion_recents_clite_state`），
+     并删掉上一次开机的 `/data/adb/axion_recents_stock_home_kept`；
+   * 确认我们这条 `apk_path` 还在 LSPosed 的 `modules_config.db` 里（不在就写 WARNING：
+     LSPosed 会静默跳过路径失效的模块，权限/显示补丁全部不生效）；
+   * `HOME role → com.motorola.launcher3`，**重建**原厂桌面进程（`am force-stop` + `am start`）；
+   * 功能性探测（最多 12 轮、每轮退避 15 s）：原厂桌面进程活着 + 有焦点 + 无崩溃 +
+     **补丁真的进了该进程**（`logcat -s AXMOTO` 里有 `module loaded pkg=com.motorola.launcher3`）；
+   * 成功才写 settle 状态 `ok <时间>`、`/data/adb/axion_recents_stock_home_kept` 与健康标记；
+     失败写 `failed` 并回退到 v1.0 行为（把 HOME 交给 Axion），保证设备一定能用。
+3. `service.sh`：先**等 boot-completed settle**（轮询 `_clite_state`，最多 20×15 s = 300 s；
+   中途发现 HOME 已不是原厂桌面、或状态是 `failed`，就自己切回旧模式分支），然后才是
+   C-lite 看门狗（8×20 s，只看 Axion quickstep 进程、原厂桌面进程、崩溃计数；
+   **绝不 force-stop 原厂桌面**），健康则写 `/data/adb/axion_recents_healthy`。
+
+> 为什么 `service.sh` 必须等：看门狗的观察窗口只有 160 s，而上面的探测最多要
+> 12 轮 ≈ 4.4 min，两者是**并发**的。早先看门狗在自己的 160 s 窗口里看不到原厂桌面进程
+> 就直接 `ax_rollback`（写 `disable` + 一键重启回原厂），把还没跑完的探测打断 —— 真机
+> 踩过一次（18:45 那次开机：探测跑到 #4 就被回滚掐了）。settle 状态文件把这两段串起来。
+
+> 为什么要"重建进程 + 检查补丁"而不是一次性判断：实测开机早期由系统拉起的原厂桌面进程
+> **拿不到** LSPosed 补丁（`patch_loaded=0`，uptime 41 s / 63 s / 86 s / 108 s …），要到
+> uptime 90 s 以上（慢的一次到 249 s）重建进程才稳定拿到（`patch_loaded=2`）。
+
+## 4. 验证
+
+```bash
+adb shell su -c 'grep -E "probe #|done \(c-lite|watchdog\(c-lite\)" /data/adb/axion_recents.log | tail -20'
+adb shell su -c 'cmd role get-role-holders --user 0 android.app.role.HOME'        # com.motorola.launcher3
+adb shell su -c 'cmd overlay lookup android android:string/config_recentsComponentName'
+#   com.android.launcher3/com.android.quickstep.RecentsActivity
+adb shell su -c 'dumpsys activity services com.android.quickstep.TouchInteractionService | grep -A2 ServiceRecord'
+#   绑定方应是 com.android.systemui（即 Axion 的手势宿主）
+adb shell su -c 'logcat -d -s AXMOTO | grep -c granted'                            # > 0
+adb shell input keyevent 187                                                        # 出 Axion 堆叠卡
+```
+
+期望的开机日志：
+
+```
+[boot-completed] C-LITE MODE (/data/adb/axion_recents_stock_home): …
+[boot-completed]   probe #1 : moto pid= focused=0 crashes=0 patch_loaded=0 uptime=41s
+[boot-completed]   probe #3 : moto pid=11010 focused=1 crashes=0 patch_loaded=2 uptime=91s
+[boot-completed] done (c-lite: HOME untouched, recents = com.android.launcher3, healthy marker written)
+[service] watchdog(c-lite): t=8x20s axion=3980 moto=11010 launcher_crashes=0 systemui_crashes=0
+[service] watchdog(c-lite): healthy after 160s (…)
+```
+
+## 5. 已知代价 / 限制
+
+* **转场动画降级**：桌面不是"最近任务组件"，`OverviewComponentObserver` 走
+  `FallbackActivityInterface`：上滑只剩"窗口缩小淡出 + 启动 `RecentsActivity`"的一次性转场，
+  丢的是**手势连续性**（窗口不跟手、悬停不预览、同手势横滑切换没有），堆叠卡/全部清除/锁定/
+  截屏/自由窗口都还在。想要一体化动画就只能让 Axion 同时当桌面（默认模式）。
+* **开机早期原厂桌面可能闪崩几次**：补丁注入要等到 uptime ≈90 s（慢的一次 249 s），这之前的
+  原厂桌面进程会因为同一处 `MANAGE_ACTIVITY_TASKS` 崩溃反复重启；`boot-completed` 会带退避地
+  重建进程直到补丁真的进进程（最多 12 轮 ≈ 4.4 min），成功后即稳定。代价是开机的头几分钟
+  桌面可能不可用，且 `service.sh` 的看门狗要等 settle 才开始计时。
+* **helper APK 路径必须与 LSPosed 数据库一致**：重装/更新 helper 之后要重跑
+  `_clite_install.ps1`（或把模块在 LSPosed 里关掉再打开），否则模块被静默跳过。
+* 系统 OTA / 重装 KernelSU 之后需要重新做第 2 步。
+
+## 6. 回滚
+
+```bash
+# 1) 关掉 C-lite（回到 v1.0 行为：Axion 桌面 + Axion 最近任务）
+adb shell su -c 'rm -f /data/adb/axion_recents_stock_home /data/adb/axion_recents_stock_home_kept'
+# 2) 想完全回原厂：KernelSU 里停用 axion_recents 模块 + LSPosed 里停用 com.axion.motodesktop，重启
+adb shell su -c 'cmd package set-home-activity com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher'
+```
+
+`_tools\_clite_test2.sh`（快速回环：不重启，直接切 HOME 试原厂桌面）、
+`_tools\_clite_verify.sh`（开机后一次性打印全部判据）是同目录下的调试脚本。
+
+## 7. 桌面不出现在最近任务里（build-77 起）
+
+C-lite 下 `config_recentsComponentName` 指向 Axion，而 HOME 是原厂桌面 ⇒ 概览总是走
+`OverviewComponentObserver` 的 `FallbackActivityInterface`，宿主是 `FallbackRecentsView`。
+上游这段代码为了让"第三方桌面上也能用手势快速切换"，会给 **home 任务造一张临时卡片**，
+而且是在**两个**地方造的：
+
+1. `onGestureAnimationStartOnHome()` 记下 `mHomeTask`，随后 `RecentsView.showCurrentTask()`
+   （`RecentsView.java:3216-3240`）为运行任务建一个"临时不可见 tile"——`shouldAvoidAddingStubTaskView()`
+   返回 false 时就会 `getTaskViewFromPool(SINGLE)` + `bind(new SingleTask(Task.from(...)))`；
+   从桌面开始的手势、以及 `applyLoadPlan` 之后的 `showCurrentTask(applyLoadPlan)` 各调一次；
+2. `FallbackRecentsView.applyLoadPlan()` 里再 `newList.add(new SingleTask(mHomeTask))`。
+
+两处都注释成"不可见"，但 Axion 的堆叠布局用 `getHomeTaskView()`
+（= `getTaskViewByTaskId(mHomeTask.key.id)`）当**栈中心**，于是原厂桌面以一张**透明、无缩略图的
+卡**出现在正中，直到 `onPrepareGestureEndAnimation()`（150 ms dismiss）撤掉 —— 用户看到的
+就是"从桌面进最近任务，主卡先是一张透明的桌面卡，反应过来后才变成上次打开的应用"。
+
+**只改 `applyLoadPlan()` 不够（build-76 的教训）**：load plan 里本来就没有 home 任务（AMS
+的任务列表里那条启动器任务不进 load plan），真正被看见的卡是第 1 处 `showCurrentTask()` 建的
+stub。build-76 的日志里仍能看到 `showCurrentTask(onGestureAnimationStart)` 之后紧跟
+`TaskView: onBind` + `TaskViewModel: bind … to taskIds: [8055]`（8055 = 启动器任务），
+`showCurrentTask(applyLoadPlan)` 之后又一次。
+
+修法（`tree\quickstep\src\com\android\quickstep\fallback\FallbackRecentsView.java`）：
+
+* 新增 `private int mHomeTaskId = INVALID_TASK_ID`，在 `onGestureAnimationStartOnHome()` 里记录、
+  在 `onGestureAnimationEnd()` 里清空（**不能**用 `mHomeTask`：同一手势里
+  `setCurrentTask(-1)` 会把它置空，于是 `applyLoadPlan` 那次 `showCurrentTask()` 又会退回上游行为）；
+* `shouldAvoidAddingStubTaskView()` 在 `groupedTaskInfo.containsTask(mHomeTaskId)` 时返回 true
+  ⇒ 永远不为 home 任务建 task view；
+* `applyLoadPlan()` 不再追加 home 任务（保留 `mHomeTask` 字段，`setRunningTaskHidden()` 仍在用）。
+
+`AxStackRecentsView` 本来就能处理 `getHomeTaskView() == null`（默认模式一直是 null），
+`getStackCenterTaskIndex()`/`isStackTask()` 都是 null-safe；`getTaskIdsForRunningTaskView()`
+在 `mRunningTaskViewId == -1` 时返回空数组，也是上游既有的"空最近任务"路径。
+结果：**最近任务里只有真实应用的任务卡**。
+
+验证（真机 build-77）：
+
+* 从桌面做起手上滑进最近任务，日志里不再出现 home 任务 id 的 `TaskViewModel: bind`；
+  手势中途、抬手瞬间、稳定后三张截图里主卡都是真实应用（无透明卡）；
+* 回归：最近任务键（187）、点卡打开应用、全部清除、从桌面快速切换手势、
+  **从真实应用上滑**（走的是上游正常路径，运行应用仍有一张 live tile 卡）均正常，无崩溃。
+
+相关 payload：build-77 = 42,969,707 B、md5 `bc29e50ca1c8126ec66ba22627cb978b`
+（build-76 备份在 `_tools\payload-build76.apk`，md5 `3364d292f2d3c54acb4bb0f10832cf55`；
+设备上 `/data/local/tmp/AxionLauncher3.bak.apk` 是改动前的 11,149,001 B 版本）。

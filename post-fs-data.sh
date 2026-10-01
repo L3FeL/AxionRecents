@@ -127,6 +127,11 @@ if [ "$n" -ge 2 ]; then
     exit 0
 fi
 
+# v2.0 C-lite：boot-completed.sh 会写 /data/adb/axion_recents_clite_state（pending -> ok/failed）
+# 表示“本次开机的 C-lite 切换是否已经 settle”。service.sh 靠它决定要不要等 boot-completed
+# 做完再启动健康看门狗（否则看门狗会在探测还没跑完时就判定不健康并回滚）。每开机先清掉。
+rm -f /data/adb/axion_recents_clite_state
+
 # --- v1.7 崩溃循环熔断（上一次开机 service.sh 判定桌面崩溃循环时留下的标记）------
 # 标记存在 ⇒ 本次开机**完全不挂载**：不新增 priv-app 目录、不启用 RRO，
 # 系统以“原厂桌面 + 原厂 recents 配置”启动。这样即使 payload 有问题，
