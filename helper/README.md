@@ -3,7 +3,7 @@
 这个 APK 只做一件事：让 **原厂 Moto 桌面当 HOME 时也能安全地拉起 recents 手势**，
 这样模块就可以把「最近任务」换成 Axion 的堆叠式，而桌面仍归 `com.motorola.launcher3`。
 
-只有走 **C-lite** 模式才需要它（标记文件 `/data/adb/axion_recents_stock_home` 存在）。
+只有走 **C-lite** 模式才需要它（在 LSPosed 里启用它 + 重启即为 C-lite）。
 默认模式（Axion 同时当桌面和 recents）**不需要**装它。
 
 ## 它改了什么
@@ -45,22 +45,23 @@ pwsh -File helper\build-helper.ps1 -SdkRoot "$env:ANDROID_SDK_ROOT" -JdkHome "$e
 
 ## 安装（C-lite）
 
-模块 zip 里已经带上这个 APK（`extras/motodesktop-helper.apk`，刷完模块后在设备上位于
-`/data/adb/modules/axion_recents/extras/`）：
+刷入 **axion_recents** 模块时会**自动安装本 APK**：`customize.sh` 尽力执行
+`pm install -r -d "$MODPATH/extras/motodesktop-helper.apk"`（装不上也不中止刷入，下次开机重试）；
+`service.sh` 每次开机会调用 `ensure_helper_installed()`，比较 `extras/motodesktop-helper.apk`
+与已装 `pm path com.axion.motodesktop` 的 base.apk 的 sha256，不一致才重装 ——
+所以更新模块时桥接会**自动升级**到 `extras/` 里那一份。刷完后它位于设备上
+`/data/adb/modules/axion_recents/extras/motodesktop-helper.apk`。
 
-```bash
-adb push motodesktop-helper.apk /data/local/tmp/
-adb shell su -c 'pm install -r /data/local/tmp/motodesktop-helper.apk'
-```
+你只需要：
 
-**必须用经典 `pm install`，不要用 `adb install`（incremental）**：incremental 的
-`/data/app/~~…==/…/base.apk` 路径每次重启会变，而 LSPosed 的
-`/data/adb/lspd/config/modules_config.db` 记的是绝对路径，对不上它会**静默跳过**整个模块。
+1. 在 LSPosed 管理器里**启用**「Axion 桌面桥接」；
+2. 作用域勾 `系统框架 system` 与 `Moto 应用启动器 com.motorola.launcher3`
+   （详情页里这两行会标「推荐应用」）；
+3. **重启**（启用即 C-lite，停用即默认模式，不再需要 `touch` 任何标记文件）。
 
-然后在 LSPosed 管理器里启用「Axion 桌面桥接」，作用域勾 `系统框架 system` 与
-`Moto 应用启动器 com.motorola.launcher3`（详情页里这两行会标「推荐应用」），
-再 `touch /data/adb/axion_recents_stock_home` 并重启。完整步骤见
-[`../docs/C-LITE.md`](../docs/C-LITE.md)。
+**不需要**手工 `pm install`，也**不需要**在 LSPosed 数据库里对齐 `apk_path`：v1.2 起 LSPosed 会
+自己刷新该字段（实测 `pm install -r` 之后约 6 秒，`/data/adb/lspd/config/modules_config.db` 里的
+`modules.apk_path` 已指向新的 base.apk）。完整步骤见 [`../docs/C-LITE.md`](../docs/C-LITE.md)。
 
 ## 许可
 

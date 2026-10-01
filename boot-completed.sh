@@ -64,8 +64,15 @@ if [ "$rro_eff" != "1" ]; then
 fi
 
 # --- v2.0 C-lite 模式：原厂 Moto 桌面保留 HOME，Axion 只提供最近任务 --------------------
-# 标记：/data/adb/axion_recents_stock_home（存在即启用本模式）
+# 判定：桥接是否在 LSPosed 里启用（v1.2 起不再需要任何标记文件）
 #
+# 用户只需在 LSPosed 里启用/停用 com.axion.motodesktop：
+#   * 启用 → 桥接在 system_server 里装上权限 hook，并用 XposedBridge.log() 写下一行带**本开机
+#     boot_id** 的握手行（LSPosed 会落到 /data/adb/lspd/log/modules_<boot>.log）⇒ 本脚本据此判 C-lite；
+#   * 停用/没装 → 这行不存在或 boot_id 对不上 ⇒ 立刻走默认模式（HOME 交给 Axion），不做任何探测、
+#     不留等待窗口（默认模式下原厂桌面本来就不该持有 HOME）。
+# 为什么用 boot_id 而不是"日志文件的时间戳"：日志文件是每开机一份，但若某次开机 LSPosed 没跑，
+# 最新的那个文件仍是上一次开机的 ⇒ 只看文件会误判。boot_id 是内核每次开机重新生成的，不会过期。
 # 为什么必须配一个 LSPosed 补丁：我们的静态 RRO 把 config_recentsComponentName 指到
 # com.android.launcher3 之后，PMS 只把带 recents 保护标志的权限（MANAGE_ACTIVITY_TASKS /
 # REMOVE_TASKS / ROTATE_SURFACE_FLINGER …）授给"recents 包"⇒ 原厂 com.motorola.launcher3
@@ -81,23 +88,37 @@ fi
 #   开机扫描时的清单授权，`MANAGE_ACTIVITY_TASKS: granted=true` 永远不会出现（v2.0 实测踩过）。
 # 改用功能性探测：把 HOME 交给原厂桌面 → 看它的主进程是否稳定存活 + 拿到焦点 + 没有新崩溃。
 # 不生效就退回旧行为（把 HOME 交给 com.android.launcher3），保证设备可用。
-STOCK_HOME=/data/adb/axion_recents_stock_home
+BRIDGE_LOG=$(ls -t /data/adb/lspd/log/modules_*.log 2>/dev/null | head -1)
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+bridge_active=0
+bridge_boot=""
+if [ -n "$BRIDGE_LOG" ] && [ -n "$BOOT_ID" ]; then
+    bridge_boot=$(grep -a -o 'AxionDesktopBridge active in system_server.*boot=[0-9a-fA-F-]*' "$BRIDGE_LOG" 2>/dev/null | tail -1 | sed 's/.*boot=//')
+    if [ -n "$bridge_boot" ] && [ "$bridge_boot" = "$BOOT_ID" ]; then
+        bridge_active=1
+    fi
+    log "bridge probe: log=$BRIDGE_LOG boot_id=$BOOT_ID line_boot=${bridge_boot:-<none>} active=$bridge_active"
+fi
 HEALTHY=/data/adb/axion_recents_healthy
 BOOTCOUNT=/data/adb/axion_recents_bootcount
 CLITE_STATE=/data/adb/axion_recents_clite_state
 PATCH_PKG=com.axion.motodesktop
-if [ -f "$STOCK_HOME" ]; then
-    log "C-LITE MODE ($STOCK_HOME): the stock Moto launcher keeps HOME, Axion only serves recents"
+if [ "$bridge_active" = "1" ]; then
+    log "C-LITE MODE (bridge enabled in LSPosed): the stock Moto launcher keeps HOME, Axion only serves recents"
     # 告诉 service.sh“切换正在进行”，别让它的健康看门狗在这里还没 settle 时就抢跑回滚（v2.0 踩过：
     # 看门狗 160 秒就下结论，而本探测最多要 12 轮 ≈ 4.4 分钟）。
     echo pending > "$CLITE_STATE"
     rm -f /data/adb/axion_recents_stock_home_kept
     APK_PATH=$(pm path $PATCH_PKG 2>/dev/null | head -1 | cut -d: -f2)
     log "  patch apk : $APK_PATH"
-    # LSPosed 的 modules_config.db 是二进制 sqlite：只在里面找“我们这条 apk_path 是否还在”。
+    # LSPosed 的 modules_config.db 是二进制 sqlite，而且开着 WAL：刚提交的更新可能还只在
+    # modules_config.db-wal 里（2026-10-02 实测：pm install -r 之后 .db 没变、-wal 里已经是新路径，
+    # 只看 .db 会误判“路径过期”）⇒ 两个文件一起找。
+    # 只在里面找“我们这条 apk_path 是否还在”。
     # （早先用 `grep -ao '/data/app/[^"]*motodesktop[^"]*base\.apk'` 抽路径，DB 里没有 `"` 字节，
     #   匹配会一路吃到后续记录的二进制垃圾 ⇒ 每次都误报“路径已过期”。）
-    if [ -n "$APK_PATH" ] && ! grep -aq "$APK_PATH" /data/adb/lspd/config/modules_config.db 2>/dev/null; then
+    LSP_DB=/data/adb/lspd/config/modules_config.db
+    if [ -n "$APK_PATH" ] && ! grep -aq "$APK_PATH" "$LSP_DB" "$LSP_DB-wal" 2>/dev/null; then
         log "  WARNING: LSPosed 记的模块路径已过期（它会静默跳过该模块，权限/显示补丁都不生效）"
         log "           处理：在 LSPosed 管理器里把 $PATCH_PKG 关掉再打开，或重跑安装脚本"
     fi

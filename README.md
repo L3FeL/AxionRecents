@@ -9,25 +9,31 @@
 > system priv-app, ships a static framework RRO that redirects `config_recentsComponentName` to it,
 > and hands over the HOME role at boot (with a boot-loop guard and a crash-loop watchdog).
 > Flash the zip in the manager, reboot, done. To return to the stock launcher: disable the module
-> and reboot. Since v1.1 there is also an optional **C-lite** mode (a flag file plus the companion
-> LSPosed bridge shipped in `extras/`) that keeps the stock Moto launcher as HOME and only swaps the
-> recents for the Axion stack — see [`docs/C-LITE.md`](docs/C-LITE.md). Requires root + KernelSU.
+> and reboot. Since v1.1 there is also an optional **C-lite** mode (the companion LSPosed bridge
+> shipped in `extras/`: enable it in LSPosed and reboot) that keeps the stock Moto launcher as HOME
+> and only swaps the recents for the Axion stack — see [`docs/C-LITE.md`](docs/C-LITE.md).
+> Requires root + KernelSU.
 > See [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md) for the mechanism. Licence: GPL-3.0.
 
-**当前版本 v1.1**（v1.0 之后加入 C-lite 模式与配套 LSPosed 桥接模块）。模块 ID `axion_recents`，作者 **L3FeL**。
+**当前版本 v1.2**（v1.1 之后：C-lite 开关并入 LSPosed —— 启用桥接并重启即为 C-lite，不再需要标记文件；
+原厂侧 launcher payload 换成 release 变体，去掉 LeakCanary / `debuggable`，签名不变；诊断日志新增轮转与
+logcat ring 清理）。模块 ID `axion_recents`，作者 **L3FeL**。
 
-> **两种桌面模式**（同一个模块，靠标记文件切换）
+> **两种桌面模式**（同一个模块，靠 LSPosed 里是否启用桥接切换）
 >
-> | 模式 | 标记文件 | HOME | 最近任务 |
+> | 模式 | 触发条件 | HOME | 最近任务 |
 > | --- | --- | --- | --- |
 > | 默认（下文描述的行为） | — | Axion（`com.android.launcher3`） | Axion 堆叠式 |
-> | **C-lite** | `/data/adb/axion_recents_stock_home` | 原厂 Moto（`com.motorola.launcher3`） | Axion 堆叠式 |
+> | **C-lite** | LSPosed 里启用了桥接模块（本开机有握手） | 原厂 Moto（`com.motorola.launcher3`） | Axion 堆叠式 |
 >
 > C-lite = **原厂桌面照用，只把最近任务换成 Axion**。它额外需要一个 LSPosed 模块
 > （`moto-desktop-helper`）替原厂桌面补上 `recents` 标志权限，因为 AOSP 只把
 > `MANAGE_ACTIVITY_TASKS` 这类权限授予 `config_recentsComponentName` 指向的包；
 > 该 LSPosed 模块声明（`xposedscope`）里只有两个作用域：`android`（系统框架 = system_server）
 > 与 `com.motorola.launcher3`（原厂桌面进程），其余应用都不需要。
+> 切换方式：在 LSPosed 里**启用/停用**「Axion 桌面桥接」→ 重启；模块脚本靠
+> **本开机的桥接握手**（`bridge probe`，见 [`docs/C-LITE.md`](docs/C-LITE.md)）判断走哪个模式，
+> v1.1 的标记文件 `/data/adb/axion_recents_stock_home` 已废弃。
 > C-lite 下**桌面本身不会出现在最近任务里**（只显示真实应用的任务卡）。
 > 安装、验证、代价与回滚见 [`docs/C-LITE.md`](docs/C-LITE.md)。
 
@@ -64,7 +70,7 @@
 
 ## 3. 安装
 
-1. 从本仓库的 **Releases** 页面下载 `AxionRecents-v1.1.zip`（并核对 sha256）。
+1. 从本仓库的 **Releases** 页面下载 `AxionRecents-v1.2.zip`（并核对 sha256）。
 2. KernelSU 管理器 → **模块** → **从本地安装** → 选择该 zip → 重启。
 3. 重启后约 1 分钟，模块会自己做完自检。**务必等它通过再动手**：
 
@@ -84,29 +90,20 @@
 
 ### 想让原厂桌面留着？（C-lite：原厂桌面 + Axion 最近任务）
 
-不想换桌面、只想要堆叠式最近任务，就从 v1.1 起用 **C-lite** 模式：
+不想换桌面、只想要堆叠式最近任务，就用 **C-lite** 模式：
 
-1. 安装配套 LSPosed 桥接（刷入模块后它就在设备上：`/data/adb/modules/axion_recents/extras/motodesktop-helper.apk`）：
-
-   ```bash
-   adb push motodesktop-helper.apk /data/local/tmp/
-   adb shell su -c 'pm install -r /data/local/tmp/motodesktop-helper.apk'
-   ```
-
-   **必须用经典 `pm install`，不要用 `adb install`（incremental）**：incremental 的
-   `/data/app/~~…==/…/base.apk` 路径每次重启会变，而 LSPosed 数据库记的是绝对路径，
-   对不上它会**静默跳过**整个模块（`logcat -s AXMOTO` 一行都没有）。
-
-2. LSPosed 管理器里启用「Axion 桌面桥接」，作用域只勾
+1. **桥接 APK 不用你管**：模块 zip 自带 `extras/motodesktop-helper.apk`，`customize.sh` 在刷入时
+   会尽力 `pm install -r -d` 装好（装不上也不中止，下次开机会重试）；此后 `service.sh` 每次开机
+   都会核对 `extras/` 里那份与已装 `com.axion.motodesktop` 的 sha256，不一致就自动 `pm install -r -d` 升级。
+   正常情况下你什么都不用做，也**不需要**手工 `pm install`。
+2. 在 LSPosed 管理器里**启用**「Axion 桌面桥接」，作用域只勾
    `系统框架 system` 与 `Moto 应用启动器 com.motorola.launcher3`（详情页里这两行会标「推荐应用」）。
-3. 开标记并重启：
+   （也可以用 `_tools/_clite_install.ps1` 在命令行里开关，`-Off` 关闭。）
+3. **重启**。重启后脚本会在 LSPosed 日志里找到本开机的桥接握手（`bridge probe: … active=1`），
+   于是进入 C-lite。
 
-   ```bash
-   adb shell su -c 'touch /data/adb/axion_recents_stock_home'
-   adb shell su -c 'reboot'
-   ```
-
-回到默认模式：`su -c 'rm -f /data/adb/axion_recents_stock_home'` 后重启。
+回到默认模式：在 LSPosed 里**停用**「Axion 桌面桥接」→ 重启。
+v1.1 留下的 `/data/adb/axion_recents_stock_home` 已失效（不再被读取），可以直接删掉。
 为什么必须装那个桥接、开机流程、验证命令与回滚，见 [`docs/C-LITE.md`](docs/C-LITE.md)。
 
 ## 4. 回原厂桌面 / 卸载
@@ -200,8 +197,8 @@ AxionRecents/
 ├── module.prop                     # 模块元数据（id / 版本 / 描述）
 ├── customize.sh                    # 刷入钩子：chmod + chcon
 ├── post-fs-data.sh                 # 目录级 tmpfs 镜像 + 开机计数 / 熔断闸口
-├── service.sh                      # 开机自检、RRO 生效判定、HOME 交接、崩溃循环看门狗
-├── boot-completed.sh               # 开机完成后再确认一次并交接 HOME（含 C-lite 分支）
+├── service.sh                      # 开机自检、RRO 生效判定、HOME 交接、崩溃循环看门狗、诊断轮转
+├── boot-completed.sh               # 开机完成后再确认一次并交接 HOME（C-lite 由本开机的桥接握手决定）
 ├── payload/
 │   ├── AxionLauncher3.apk          # 被打进 /system_ext/priv-app 的 Axion 桌面（com.android.launcher3）
 │   ├── AxionRecentsOverlay.apk     # 静态框架 RRO（只改 config_recentsComponentName）

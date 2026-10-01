@@ -8,6 +8,8 @@ import android.os.Binder;
 import android.util.Log;
 import android.view.Display;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
 import java.lang.reflect.Member;
 import java.lang.reflect.Method;
 import java.util.Arrays;
@@ -91,6 +93,17 @@ public class Main implements IXposedHookLoadPackage {
             }
             Log.i(TAG, "module loaded pkg=" + pkg + " process=" + lpparam.processName);
             installHooks(lpparam.classLoader, systemServer);
+            if (systemServer) {
+                // v1.2: persistent, boot-scoped signal for the KernelSU module scripts.
+                // LSPosed writes every XposedBridge.log() call into
+                // /data/adb/lspd/log/modules_<boot>.log, which boot-completed.sh / service.sh read as
+                // root to decide between C-lite (stock launcher keeps HOME) and the default mode.
+                // The boot id makes the line unambiguous: a line left over from an earlier boot can
+                // never switch the current boot into C-lite. Keep the prefix/label in sync with
+                // BRIDGE_LOG_LABEL in boot-completed.sh + service.sh.
+                XposedBridge.log("AxionDesktopBridge active in system_server hooks=" + sHookCount
+                        + " boot=" + readBootId());
+            }
         } catch (Throwable t) {
             Log.e(TAG, "handleLoadPackage failed", t);
         }
@@ -381,6 +394,31 @@ public class Main implements IXposedHookLoadPackage {
     private static void logOnce(String message) {
         if (LOGGED.add(message)) {
             Log.i(TAG, message);
+        }
+    }
+
+    /**
+     * Kernel boot id ({@code /proc/sys/kernel/random/boot_id}), used as the boot-scope token of the
+     * {@code XposedBridge.log()} handshake with the KernelSU module scripts. Returns {@code "?"} when
+     * the file cannot be read; the scripts compare the value with their own read of the same file and
+     * simply stay in the default mode on a mismatch, so a missing value is safe.
+     */
+    private static String readBootId() {
+        BufferedReader reader = null;
+        try {
+            reader = new BufferedReader(new FileReader("/proc/sys/kernel/random/boot_id"));
+            String line = reader.readLine();
+            return line == null ? "?" : line.trim();
+        } catch (Throwable t) {
+            return "?";
+        } finally {
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (Throwable ignored) {
+                    // nothing to do
+                }
+            }
         }
     }
 

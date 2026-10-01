@@ -46,7 +46,18 @@ ax_sui_crashes() { logcat -b crash -d 2>/dev/null | grep -c 'Process: com.androi
 # v1.9 诊断快照：把崩溃/气泡/桌面/权限拒绝的证据落到 /data（重启也不丢）。
 # v1.8 只做了 logcat crash buffer 的 grep，气泡 NPE 的“谁触发了这次转场”完全没有证据。
 DIAG=/data/adb/axion_recents_diag.log
+# v1.2：诊断快照只追加、每次开机都涨（v1.1 实测 1.6 MB / 7871 行且永不回收）。超过 512 KB 就
+# 滚一代到 <file>.old（只保留两代），避免 /data 被诊断日志慢慢吃满。
+diag_rotate() {
+    [ -f "$DIAG" ] || return 0
+    sz=$(stat -c %s "$DIAG" 2>/dev/null || echo 0)
+    if [ "$sz" -gt 524288 ] 2>/dev/null; then
+        mv -f "$DIAG" "$DIAG.old" 2>/dev/null
+        log "diag log rotated ($sz bytes -> $DIAG.old)"
+    fi
+}
 dump_diag() {
+    diag_rotate
     {
         echo "===== diag snapshot: $1 @ $(date '+%Y-%m-%d %H:%M:%S') ====="
         echo "-- pids: systemui=$(pidof com.android.systemui) system_server=$(pidof system_server) axion=$(pidof com.android.launcher3) moto=$(pidof com.motorola.launcher3) mobiledesktop=$(pidof com.motorola.mobiledesktop)"
@@ -285,15 +296,20 @@ case "$recents" in
     *)                       rro_eff=0 ;;
 esac
 log "=== HOME role (recents=$recents | staged marker=$rro_ok) ==="
-# v2.0 C-lite 判定：标记 + 实际 HOME 归属。boot-completed.sh 在补丁不生效时会退回旧模式
-# （把 HOME 交给 com.android.launcher3），此时这里必须跟着走旧分支，否则看门狗会误判。
-STOCK_HOME=/data/adb/axion_recents_stock_home
+# v1.2 C-lite 判定：桥接模块是否在 LSPosed 里启用（v1.2 起不再需要任何标记文件）。
+# 判据与 boot-completed.sh 完全一致：桥接在 system_server 里加载时用 XposedBridge.log() 写下
+# 带**本开机 boot_id** 的握手行，LSPosed 把它落到 /data/adb/lspd/log/modules_<boot>.log。
+# 桥接启用但 boot-completed 的探测失败时，它会写 `failed` 到 CLITE_STATE，下面的等待循环照样切回旧模式。
+BRIDGE_LOG=$(ls -t /data/adb/lspd/log/modules_*.log 2>/dev/null | head -1)
+BOOT_ID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
 clite=0
-if [ -f "$STOCK_HOME" ]; then
-    if cmd role get-role-holders --user 0 android.app.role.HOME 2>/dev/null | grep -q com.motorola.launcher3; then
+if [ -n "$BRIDGE_LOG" ] && [ -n "$BOOT_ID" ]; then
+    bridge_boot=$(grep -a -o 'AxionDesktopBridge active in system_server.*boot=[0-9a-fA-F-]*' "$BRIDGE_LOG" 2>/dev/null | tail -1 | sed 's/.*boot=//')
+    if [ -n "$bridge_boot" ] && [ "$bridge_boot" = "$BOOT_ID" ]; then
         clite=1
+        log "C-LITE mode: bridge handshake for this boot (log=$BRIDGE_LOG boot_id=$BOOT_ID)"
     else
-        log "C-LITE marker present but the HOME role is not the stock launcher -> boot-completed fell back to the old mode this boot"
+        log "not C-lite: no bridge handshake for this boot (log=$BRIDGE_LOG line_boot=${bridge_boot:-<none>} boot_id=$BOOT_ID)"
     fi
 fi
 # v2.0：boot-completed.sh 要带退避地重建原厂桌面进程、确认补丁真的进了进程（最多 12 轮 ≈ 4.4 分钟）
@@ -439,6 +455,39 @@ else
         fi
     fi
 fi
+# v1.2 维护阶段：桥接 APK 由模块自己安装/升级，用户不需要再手动 `pm install`。
+# 判据是内容哈希：已装的那份和 extras/ 里的一致就什么都不做（免得每次开机都替换包，让 LSPosed
+# 重新加载模块）。必须用 `pm install -r`；**不要**用 adb install 的增量安装（路径会变得不可预测）。
+HELPER_SRC="$MODDIR/extras/motodesktop-helper.apk"
+HELPER_PKG=com.axion.motodesktop
+ensure_helper_installed() {
+    [ -f "$HELPER_SRC" ] || { log "helper: $HELPER_SRC missing in the module - skipping"; return 0; }
+    sum_src=$(sha256sum "$HELPER_SRC" 2>/dev/null | cut -d' ' -f1)
+    have=$(pm path "$HELPER_PKG" 2>/dev/null | head -1 | sed 's/^package://')
+    sum_have=""
+    [ -n "$have" ] && sum_have=$(sha256sum "$have" 2>/dev/null | cut -d' ' -f1)
+    if [ -n "$sum_src" ] && [ "$sum_src" = "$sum_have" ]; then
+        return 0
+    fi
+    if [ -n "$have" ]; then
+        log "helper: updating $HELPER_PKG ($have ${sum_have:-?} -> ${sum_src:-?})"
+    else
+        log "helper: installing $HELPER_PKG from $HELPER_SRC"
+    fi
+    log "  pm install : $(pm install -r -d "$HELPER_SRC" 2>&1 | tr '\n' ' ')"
+    have2=$(pm path "$HELPER_PKG" 2>/dev/null | head -1 | sed 's/^package://')
+    log "  installed  : ${have2:-<none>}"
+    if [ -n "$have2" ] && [ "$(sha256sum "$have2" 2>/dev/null | cut -d' ' -f1)" != "$sum_src" ]; then
+        log "  WARNING: the installed helper still differs from the module copy - reinstall from KernelSU"
+    fi
+    log "  NOTE: enable $HELPER_PKG in LSPosed (scope: system framework + Moto launcher) and reboot for C-lite"
+}
+
 kill $LOGCAT_PID 2>/dev/null
 log "logcat ring stopped (pid=$LOGCAT_PID)"
+# v1.2：环形记录停了就删掉文件（v1.1 实测残留 3 x 8 MB ≈ 26 MB 且永不回收）。需要的证据已经由
+# dump_diag() 摘录进 $DIAG，这里不必再留一份原始日志。
+rm -f "$LOGCAT_RING" "$LOGCAT_RING".* 2>/dev/null
+log "logcat ring files removed"
+ensure_helper_installed
 log "service.sh finished"
