@@ -22,7 +22,21 @@ privapp 白名单和 `pm grant` 都救不了（前者只对 `privileged` 标志�
   对 uid = `com.motorola.launcher3` 判为已授予；
 * `com.motorola.launcher3`（原厂桌面进程）作用域：给 `android.app.ContextImpl#getDisplay`
   兜底 —— Moto 用 application context 预热 task view pool 时会抛
-  `UnsupportedOperationException: Tried to obtain display from a Context not associated with one`。
+  `UnsupportedOperationException: Tried to obtain display from a Context not associated with one`；
+  另外修好 C-lite 下被 RRO 连带关掉的两个桌面手势（v1.2.1 起）：
+  * `SystemUiProxy#isActive` / `#onStatusBarTouchEvent` —— 原厂桌面的触摸流本来要转给 SystemUI
+    拖动帷幕，但 C-lite 下 `mSystemUiProxy == null`（SystemUI 绑的是 Axion 的
+    `TouchInteractionService`），`isActive()` 恒 false ⇒ 桌面下滑连拦截都进不去。桥接只在
+    proxy 为 null 时把 `isActive()` 判为 true，并在抬手时按位移改调
+    `StatusBarManager.expandSettingsPanel(null)`（长滑）/ `expandNotificationsPanel()`（短滑）；
+  * `SystemUiProxy#lockDevice` —— 同一个 null proxy 让「双击空白处息屏」在
+    `WorkspaceTouchListener.lockScreen()` 里静默 return；桥接改调
+    `PowerManager.goToSleep(SystemClock.uptimeMillis())`；
+  * 为此在 system_server 侧给原厂桌面的 uid 追加放行 `android.permission.DEVICE_POWER` 与
+    `android.permission.EXPAND_STATUS_BAR`（两者都不在原厂桌面 manifest 里）；
+  * `Utilities#isSleepScreenEnabled` 的 after-hook 只在 `put_display_to_sleep` 完全未设置时兜底。
+
+  机制、阈值实测表与验证命令见 [`../docs/C-LITE.md`](../docs/C-LITE.md) 第 8 节。
 
 ## 作用域声明（`xposedscope`）
 

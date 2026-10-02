@@ -29,6 +29,19 @@ if (-not $SdkRoot) { $SdkRoot = $env:ANDROID_HOME }
 if (-not $SdkRoot) { throw 'no SDK root: pass -SdkRoot or set ANDROID_SDK_ROOT / ANDROID_HOME' }
 if (-not $JdkHome) { throw 'no JDK: pass -JdkHome or set JAVA_HOME' }
 
+# Version of the bridge mirrors the module release (../module.prop) so the two can never drift.
+$versionCode = '1'
+$versionName = '1.0'
+$modProp = Join-Path (Split-Path $Src -Parent) 'module.prop'
+if (Test-Path $modProp) {
+    $mp = Get-Content $modProp -Raw
+    if ($mp -match '(?m)^versionCode=(\S+)') { $versionCode = $Matches[1].Trim() }
+    if ($mp -match '(?m)^version=(\S+)') { $versionName = $Matches[1].Trim().TrimStart('v') }
+} else {
+    Write-Warning "no module.prop next to $Src - keeping version $versionName ($versionCode)"
+}
+Write-Host "== version   : $versionName ($versionCode)"
+
 if (-not $BuildTools) {
     $btRoot = Join-Path $SdkRoot 'build-tools'
     if (-not (Test-Path $btRoot)) { throw "no build-tools under $SdkRoot" }
@@ -77,7 +90,7 @@ Invoke-Strict 'aapt2 link' {
         $resZip `
         --java (Join-Path $work 'gen') `
         --min-sdk-version 29 --target-sdk-version 34 `
-        --version-code 1 --version-name 1.0
+        --version-code $versionCode --version-name $versionName
 }
 
 $srcs = @(Get-ChildItem (Join-Path $Src 'java') -Recurse -Filter *.java | ForEach-Object FullName)

@@ -5,8 +5,10 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PermissionInfo;
 import android.hardware.display.DisplayManager;
 import android.os.Binder;
+import android.os.SystemClock;
 import android.util.Log;
 import android.view.Display;
+import android.view.MotionEvent;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -41,6 +43,15 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * those specific permissions when the caller is the target launcher. It only ever <em>grants</em>,
  * never denies, only for the target app id, and only for permissions that carry the platform's
  * {@code recents} protection flag (or are in the explicit fallback list).
+ *
+ * <p>It also runs inside the Moto launcher process itself, where it repairs the two home-screen
+ * gestures that C-lite breaks. Both are implemented by the Moto launcher but executed through
+ * {@code com.android.quickstep.SystemUiProxy}, whose {@code mSystemUiProxy} field is only filled
+ * when SystemUI binds <em>this</em> launcher's TouchInteractionService. Because C-lite gives the
+ * recents role to Axion, SystemUI binds Axion instead: the field stays null, so
+ * {@code SystemUiProxy.isActive()} answers false (a swipe down is never intercepted) and
+ * {@code lockDevice()} returns silently (the double tap dies at its last gate). See
+ * {@link #installCliteGestureHooks}.
  */
 public class Main implements IXposedHookLoadPackage {
 
@@ -50,7 +61,16 @@ public class Main implements IXposedHookLoadPackage {
     private static final int PER_USER_RANGE = 100000;
     private static final int PERMISSION_GRANTED = 0;
 
-    /** Used when PermissionInfo.PROTECTION_FLAG_RECENTS cannot be reflected (older releases). */
+    /**
+     * Used when PermissionInfo.PROTECTION_FLAG_RECENTS cannot be reflected (older releases), and as
+     * the exact list of extra permissions granted to the target launcher.
+     *
+     * <p>The C-lite gesture repair needs two ordinary (non-recents) permissions that the Moto
+     * launcher does not request at all: DEVICE_POWER for PowerManager.goToSleep() and
+     * EXPAND_STATUS_BAR for the notification-shade/control-centre expansion. Both are enforced
+     * inside system_server through ContextImpl.enforceCallingOrSelfPermission, i.e. through the
+     * funnel hooked below.
+     */
     private static final Set<String> FALLBACK_RECENTS_PERMS = new HashSet<String>(Arrays.asList(
             "android.permission.MANAGE_ACTIVITY_TASKS",
             "android.permission.REMOVE_TASKS",
@@ -59,7 +79,9 @@ public class Main implements IXposedHookLoadPackage {
             "android.permission.STOP_APP_SWITCHES",
             "android.permission.SET_ORIENTATION",
             "android.permission.CONTROL_REMOTE_APP_TRANSITION_ANIMATIONS",
-            "android.permission.START_TASKS_FROM_RECENTS"));
+            "android.permission.START_TASKS_FROM_RECENTS",
+            "android.permission.DEVICE_POWER",
+            "android.permission.EXPAND_STATUS_BAR"));
 
     private static final String[] CONTEXT_METHODS = new String[] {
             "checkPermission",
@@ -78,6 +100,8 @@ public class Main implements IXposedHookLoadPackage {
     private static volatile int sRecentsFlag = Integer.MIN_VALUE;
     private static volatile int sHookCount;
     private static volatile boolean sSystemServer;
+    /** Class loader of the Moto launcher process; null inside system_server. */
+    private static volatile ClassLoader sTargetClassLoader;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -143,12 +167,50 @@ public class Main implements IXposedHookLoadPackage {
             hookMethod(cl, "com.android.server.pm.permission.PermissionManagerServiceImpl",
                     "shouldGrantPermissionByProtectionFlags", new GrantByFlagsHook());
         } else {
+            sTargetClassLoader = cl;
             // Target app process only: Moto's launcher builds its task view pool on a background
             // thread with a non-visual context, and Android 12+ makes Context.getDisplay() throw
             // for those. See DisplayFallbackHook.
             hookMethod(cl, "android.app.ContextImpl", "getDisplay", new DisplayFallbackHook());
+            // Repair the two home-screen gestures C-lite breaks (mSystemUiProxy is never set).
+            installCliteGestureHooks(cl);
         }
         Log.i(TAG, "hooks installed: " + sHookCount);
+    }
+
+    /**
+     * C-lite gesture repair, installed in the {@code com.motorola.launcher3} process only.
+     *
+     * <p>Reason the stock code is dead: {@code SystemUiProxy.mSystemUiProxy} is assigned by
+     * {@code TouchInteractionService$TISBinder.setProxy()} and SystemUI only binds the service of
+     * the package named by {@code config_recentsComponentName}. C-lite points that at Axion, so the
+     * Moto launcher never gets a proxy:
+     * <ul>
+     *   <li>double tap on empty workspace -> {@code WorkspaceTouchListener.lockScreen()} ->
+     *       {@code SystemUiProxy.lockDevice(true)} -> {@code if (mSystemUiProxy == null) return}
+     *       (no log, no action);</li>
+     *   <li>swipe down on workspace -> {@code StatusBarTouchController.canInterceptTouch()} ->
+     *       {@code return SystemUiProxy.isActive()} -> false, so the gesture is never even
+     *       intercepted.</li>
+     * </ul>
+     *
+     * <p>All four hooks below only act when the proxy really is missing, so a launcher that does own
+     * the recents role keeps its stock behaviour.
+     */
+    private static void installCliteGestureHooks(ClassLoader cl) {
+        // 1) Keep the double tap active. Utilities.isSleepScreenEnabled() decides whether the
+        //    gesture does anything and is called from exactly one place (WorkspaceTouchListener).
+        hookMethod(cl, "com.android.launcher3.Utilities", "isSleepScreenEnabled",
+                new SleepScreenGateHook());
+        // 2) Let the swipe-down touch stream through the interception gate.
+        hookMethod(cl, "com.android.quickstep.SystemUiProxy", "isActive", new SystemUiActiveHook());
+        // 3) Perform the expansion the forwarded stream used to trigger in SystemUI.
+        hookMethod(cl, "com.android.quickstep.SystemUiProxy", "onStatusBarTouchEvent",
+                new StatusBarTouchHook());
+        // 4) Safety net for the sleep action itself.
+        hookMethod(cl, "com.android.quickstep.SystemUiProxy", "lockDevice", new LockDeviceHook());
+        XposedBridge.log("AxionDesktopBridge clite gestures installed in launcher hooks=" + sHookCount
+                + " boot=" + readBootId());
     }
 
     private static void hookClass(ClassLoader cl, String className, String[] methodNames) {
@@ -418,6 +480,224 @@ public class Main implements IXposedHookLoadPackage {
                 } catch (Throwable ignored) {
                     // nothing to do
                 }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // C-lite gestures (double tap to sleep, swipe down to the shade/control centre)
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * True when this launcher owns the recents role and therefore has a live SystemUI proxy. When
+     * the field cannot be read we answer {@code true} so the stock path is left completely alone.
+     */
+    private static boolean hasSystemUiProxy(Object systemUiProxyInstance) {
+        try {
+            return XposedHelpers.getObjectField(systemUiProxyInstance, "mSystemUiProxy") != null;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    /** Reads a Moto framework setting ({@code com.motorola.android.provider.MotorolaSettings.Global}). */
+    private static String readMotoGlobal(String key) {
+        try {
+            Class<?> clazz = XposedHelpers.findClass(
+                    "com.motorola.android.provider.MotorolaSettings$Global", sTargetClassLoader);
+            Object value = XposedHelpers.callStaticMethod(clazz, "getString",
+                    systemContext().getContentResolver(), key);
+            return value instanceof String ? (String) value : null;
+        } catch (Throwable t) {
+            Log.i(TAG, "readMotoGlobal(" + key + ") failed: " + t);
+            return null;
+        }
+    }
+
+    /** Moto-space id used by the stock gesture gate; non-empty means the stock gesture is off. */
+    private static String motoSpaceId() {
+        try {
+            Class<?> clazz = XposedHelpers.findClass(
+                    "com.android.launcher3.settings.MotoSpaceHelper", sTargetClassLoader);
+            Object value = XposedHelpers.getStaticObjectField(clazz, "sMotoSpaceId");
+            return value == null ? null : String.valueOf(value);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * Expands the notification shade (or the control centre) without the SystemUI proxy.
+     * {@code StatusBarManager} is not guaranteed to be a named system service, and the launcher dex
+     * has no reference to it at all, so everything here is reflective and falls back to the internal
+     * {@code IStatusBarService} binder.
+     */
+    private static boolean expandStatusBarPanel(boolean settingsPanel) {
+        try {
+            Object manager = systemContext().getSystemService("statusbar");
+            if (manager != null) {
+                if (settingsPanel) {
+                    XposedHelpers.callMethod(manager, "expandSettingsPanel", new Object[] {null});
+                } else {
+                    XposedHelpers.callMethod(manager, "expandNotificationsPanel");
+                }
+                logOnce("swipe down -> StatusBarManager."
+                        + (settingsPanel ? "expandSettingsPanel" : "expandNotificationsPanel"));
+                return true;
+            }
+        } catch (Throwable t) {
+            Log.i(TAG, "StatusBarManager path failed: " + t);
+        }
+        try {
+            Object binder = XposedHelpers.callStaticMethod(
+                    XposedHelpers.findClass("android.os.ServiceManager", null), "getService", "statusbar");
+            if (binder == null) {
+                logOnce("swipe down: statusbar binder unavailable");
+                return false;
+            }
+            Class<?> stub = XposedHelpers.findClass(
+                    "com.android.internal.statusbar.IStatusBarService$Stub", sTargetClassLoader);
+            Object service = XposedHelpers.callStaticMethod(stub, "asInterface", binder);
+            if (service == null) {
+                return false;
+            }
+            if (settingsPanel) {
+                XposedHelpers.callMethod(service, "expandSettingsPanel", new Object[] {null});
+            } else {
+                XposedHelpers.callMethod(service, "expandNotificationsPanel");
+            }
+            logOnce("swipe down -> IStatusBarService."
+                    + (settingsPanel ? "expandSettingsPanel" : "expandNotificationsPanel"));
+            return true;
+        } catch (Throwable t) {
+            Log.i(TAG, "expand panel failed: " + t);
+            return false;
+        }
+    }
+
+    /**
+     * Double tap on an empty workspace area -> screen off.
+     *
+     * <p>Stock {@code Utilities.isSleepScreenEnabled()} is
+     * {@code "1".equalsIgnoreCase(MotorolaSettings.Global.getString(cr, "put_display_to_sleep")) &&
+     * !MotoSpaceHelper.isMotoSpaceEnabled()}. Unset means "off" for stock, but unset is exactly what
+     * this ROM ships and what the user expects to mean the default. We only open the gate for the
+     * unset case: an explicit value ("1"/"0") is still honoured, so Moto's own setting keeps
+     * working.
+     */
+    private static final class SleepScreenGateHook extends XC_MethodHook {
+
+        @Override
+        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+            try {
+                if (Boolean.TRUE.equals(param.getResult())) {
+                    return;
+                }
+                final String raw = readMotoGlobal("put_display_to_sleep");
+                final String spaceId = motoSpaceId();
+                if (raw != null) {
+                    logOnce("sleep gate kept (put_display_to_sleep=" + raw + " motoSpaceId=" + spaceId + ")");
+                    return;
+                }
+                param.setResult(Boolean.TRUE);
+                logOnce("sleep gate opened (put_display_to_sleep unset, motoSpaceId=" + spaceId + ")");
+            } catch (Throwable t) {
+                Log.i(TAG, "sleep gate failed: " + t);
+            }
+        }
+    }
+
+    /** Lets the swipe-down gesture pass {@code StatusBarTouchController.canInterceptTouch()}. */
+    private static final class SystemUiActiveHook extends XC_MethodHook {
+
+        @Override
+        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+            try {
+                if (Boolean.TRUE.equals(param.getResult()) || hasSystemUiProxy(param.thisObject)) {
+                    return;
+                }
+                param.setResult(Boolean.TRUE);
+                logOnce("SystemUiProxy.isActive -> true (no SystemUI binding in C-lite)");
+            } catch (Throwable t) {
+                Log.i(TAG, "isActive hook failed: " + t);
+            }
+        }
+    }
+
+    /**
+     * Sleeps the device when {@code lockDevice(true)} would have asked SystemUI to do it. Only acts
+     * when the proxy is missing, so a launcher that owns the recents role is untouched.
+     */
+    private static final class LockDeviceHook extends XC_MethodHook {
+
+        @Override
+        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+            try {
+                if (hasSystemUiProxy(param.thisObject)) {
+                    return;
+                }
+                Object power = systemContext().getSystemService(Context.POWER_SERVICE);
+                if (power == null) {
+                    logOnce("lockDevice: PowerManager unavailable");
+                    return;
+                }
+                XposedHelpers.callMethod(power, "goToSleep", SystemClock.uptimeMillis());
+                param.setResult(null);
+                logOnce("lockDevice -> PowerManager.goToSleep()");
+            } catch (Throwable t) {
+                Log.i(TAG, "lockDevice fallback failed: " + t);
+            }
+        }
+    }
+
+    /**
+     * Replaces the touch stream that {@code StatusBarTouchController} would have forwarded to
+     * SystemUI: the panel is expanded on ACTION_UP instead of being dragged. A long drag opens the
+     * control centre (quick settings), anything shorter opens the plain notification shade.
+     */
+    private static final class StatusBarTouchHook extends XC_MethodHook {
+
+        private static final float CONTROL_CENTRE_TRAVEL_PX = 240f;
+
+        /** ACTION_DOWN y of the forwarded stream, -1 when no drag is in flight. */
+        private float mDownY = -1f;
+
+        @Override
+        protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
+            try {
+                if (hasSystemUiProxy(param.thisObject)) {
+                    return;
+                }
+                Object event = (param.args != null && param.args.length > 0) ? param.args[0] : null;
+                if (event == null) {
+                    return;
+                }
+                final int action =
+                        ((Integer) XposedHelpers.callMethod(event, "getActionMasked")).intValue();
+                if (action == MotionEvent.ACTION_DOWN) {
+                    mDownY = ((Float) XposedHelpers.callMethod(event, "getY")).floatValue();
+                    return;
+                }
+                if (action != MotionEvent.ACTION_UP && action != MotionEvent.ACTION_CANCEL) {
+                    return;
+                }
+                final float downY = mDownY;
+                mDownY = -1f;
+                if (action == MotionEvent.ACTION_CANCEL) {
+                    param.setResult(null);
+                    return;
+                }
+                final float travel = downY < 0f
+                        ? 0f
+                        : ((Float) XposedHelpers.callMethod(event, "getY")).floatValue() - downY;
+                final boolean controlCentre = travel > CONTROL_CENTRE_TRAVEL_PX;
+                Log.i(TAG, "swipe down: downY=" + downY + " travel=" + travel
+                        + "px -> " + (controlCentre ? "control centre" : "notifications"));
+                if (expandStatusBarPanel(controlCentre)) {
+                    param.setResult(null);
+                }
+            } catch (Throwable t) {
+                Log.i(TAG, "status bar touch hook failed: " + t);
             }
         }
     }

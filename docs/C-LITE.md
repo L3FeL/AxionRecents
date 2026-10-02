@@ -273,3 +273,82 @@ stub。build-76 的日志里仍能看到 `showCurrentTask(onGestureAnimationStar
 相关 payload：build-77 = 42,969,707 B、md5 `bc29e50ca1c8126ec66ba22627cb978b`
 （build-76 备份在 `_tools\payload-build76.apk`，md5 `3364d292f2d3c54acb4bb0f10832cf55`；
 设备上 `/data/local/tmp/AxionLauncher3.bak.apk` 是改动前的 11,149,001 B 版本）。
+
+## 8. C-lite 下被 RRO 关掉的两个桌面手势（v1.2.1 起由桥接修复）
+
+原厂桌面的「双击空白处息屏」和「下滑拉出控制中心 / 通知栏」都由 `com.motorola.launcher3` 自己实现，
+但**执行端是 `com.android.quickstep.SystemUiProxy`** —— 它只是 Binder 代理，字段 `mSystemUiProxy`
+只有在本包的 `com.android.quickstep.TouchInteractionService`（TIS）被 SystemUI 绑定时才会被赋值
+（`setProxy(...)` 的唯一调用点是 `TouchInteractionService$TISBinder`，而该 service 在 manifest 里要求
+`STATUS_BAR_SERVICE`）。C-lite 下 `config_recentsComponentName` 指向 Axion ⇒ SystemUI 绑的是 Axion 的
+TIS ⇒ **原厂桌面进程里 `mSystemUiProxy == null`**，于是：
+
+* **双击息屏**：`WorkspaceTouchListener.lockScreen()` 的前置门控（NORMAL 状态、230 ms 双击窗口、
+  位移不超 2×slop）全部通过，最后 `SystemUiProxy.lockDevice(true)` 在 `if (mSystemUiProxy != null)`
+  不成立时**静默 return**（连一行日志都没有）；
+* **下滑**：控制器注册是无条件的，但 `StatusBarTouchController.canInterceptTouch()` 最后一句是
+  `return SystemUiProxy.INSTANCE.get(mLauncher).isActive();` ⇒ ACTION_DOWN 就返回 false，触摸流连拦截
+  都进不去（`isActive()` 的实现就是 `mSystemUiProxy != null`）。
+
+v1.2.1 的桥接在**原厂桌面进程**里补了 4 个 hook（源码 `helper/java/com/axion/motodesktop/Main.java`）：
+
+| hook 点 | 行为 |
+| --- | --- |
+| `SystemUiProxy#isActive()`（before） | 仅在 `mSystemUiProxy == null` 时 `setResult(true)`：放开下滑的拦截门控，NORMAL/浮层/insets 等其它门控不动；proxy 存在时完全不干预 |
+| `SystemUiProxy#onStatusBarTouchEvent(MotionEvent)`（before） | proxy 为 null 时不再空转：抬手（ACTION_UP）时按位移改调 `StatusBarManager.expandSettingsPanel(null)` 或 `expandNotificationsPanel()`，然后 `setResult(null)` |
+| `SystemUiProxy#lockDevice(boolean)`（before） | proxy 为 null 时改调 `PowerManager.goToSleep(SystemClock.uptimeMillis())`，保留原方法签名（void） |
+| `Utilities#isSleepScreenEnabled(Context)`（after） | 原厂已返回 true 时不动；返回 false 且 `put_display_to_sleep`（读 `com.motorola.android.provider.MotorolaSettings$Global`）**完全未设置**时才放开。本机实测原厂值就是 `"1"`，所以这层是纯兜底 |
+
+短滑 vs 长滑的阈值是**从被转发的那段触摸流算起的位移**：原厂
+`StatusBarTouchController.onControllerInterceptTouchEvent()` 在 `dy > mTouchSlop` 时会把当前事件改写成
+`ACTION_DOWN` 再转发并让窗口 slippery，所以转发流的 `downY` 已经在屏幕中段。真机实测
+（`input swipe 600 700 600 700+d 250`，屏幕 1220×2712）：
+
+| 拖动距离 d | 转发流 downY | 位移 travel | 结果 |
+| --- | --- | --- | --- |
+| 200 px | 未拦截 | — | 无反应（原厂自己的门控；默认模式同样如此） |
+| 300 px | 982 | 18 px | 通知栏 |
+| 400 px | 977 | 123 px | 通知栏 |
+| 500 px | 981 | 219 px | 通知栏 |
+| 700 px | 997 | 403 px | 控制中心 |
+| 900 px | 1005 | 595 px | 控制中心 |
+| 1200 px | 1003 | 897 px | 控制中心 |
+
+即 `CONTROL_CENTRE_TRAVEL_PX = 240f`：屏幕上拖到 300–550 px 之间 ≈ 通知栏，≥ 约 570 px ≈ 控制中心
+（等价于原厂「一次连续拖动越过通知区就进控制中心」的手感）。每次抬手都会打一行
+
+```
+adb logcat -s AXMOTO:*
+I AXMOTO  : swipe down: downY=983.6 travel=316.3px -> control centre
+I AXMOTO  : swipe down -> StatusBarManager.expandSettingsPanel
+I AXMOTO  : lockDevice -> PowerManager.goToSleep()
+```
+
+想改手感就调 `CONTROL_CENTRE_TRAVEL_PX` 这一个常量。
+
+**为什么做不到和原厂 1:1 跟手**：原厂是把每一帧 MotionEvent 经
+`ISystemUiProxy.onStatusBarTouchEvent` 交给 SystemUI，再由 SystemUI 自己拖动帷幕（手指到哪帷幕到哪）。
+C-lite 下这条通道随 TIS 绑定一起消失，而 SystemUI 实现的 `ISystemUiProxy` 不是系统服务、拿不到
+binder（只有 SystemUI 主动绑定时才会拿到），所以桥接只能在**抬手时**二选一展开。
+
+两个权限（`android.permission.DEVICE_POWER`、`android.permission.EXPAND_STATUS_BAR`）原厂桌面 manifest
+里都没有，桥接在 system_server 的权限漏斗里对原厂桌面的 uid（appId）放行 —— 与 v1.1 起放行
+`recents` 标志权限的做法相同（前者的 enforcement 在 `PowerManagerService`、后者在
+`StatusBarManagerService`，都在 system_server 内，正好走已 hook 的
+`android.app.ContextImpl.enforceCallingOrSelfPermission`）。
+
+验证（真机 SDK 36，C-lite）：
+
+```bash
+adb shell input swipe 600 700 600 2000 300   # → mCurrentFocus=Window{… NotificationShade}
+                                             #   AXMOTO: swipe down -> StatusBarManager.expandSettingsPanel
+adb shell input tap 450 1750; adb shell input tap 450 1750   # 两次连点（230ms 窗口内）
+                                             # → mWakefulness=Dozing
+                                             #   AXMOTO: lockDevice -> PowerManager.goToSleep()
+```
+
+回归：最近任务键（187）与从桌面起手上滑仍进 Axion `com.android.launcher3/com.android.quickstep.RecentsActivity`，
+`logcat -b crash` 里 launcher/systemui 计数为 0；默认模式（桥接停用）行为不变。
+
+更新方式：换新 zip 刷入模块（`extras/motodesktop-helper.apk` 会在开机时自动覆盖安装旧桥接，
+见 §5），然后重启。

@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.2.1 — C-lite 下恢复原厂桌面的两个手势（双击桌面息屏 / 桌面下滑控制中心）
+
+v1.2 的 bug 修复版：没有新功能，默认模式（Axion 同时当桌面和最近任务）行为与 v1.2 完全一致，
+只更新 C-lite 用的桥接 APK，把 C-lite 下被 RRO 连带关掉的两个原厂桌面手势接回来，并给桥接补上
+「抬手时决定展开控制中心还是通知栏」的判定。
+
+* **双击桌面空白处息屏**：C-lite 下原厂桌面进程里 `SystemUiProxy.mSystemUiProxy == null`
+  （SystemUI 绑的是 Axion 的 `TouchInteractionService`），`WorkspaceTouchListener.lockScreen()` 走到
+  `SystemUiProxy.lockDevice(true)` 时在 `if (mSystemUiProxy != null)` 处**静默 return**。桥接新增
+  `SystemUiProxy#lockDevice` hook：proxy 为 null 时改调
+  `PowerManager.goToSleep(SystemClock.uptimeMillis())`，并为原厂桌面的 uid 放行
+  `android.permission.DEVICE_POWER`（其 manifest 里没有该权限；enforcement 在 system_server，
+  走桥接已有的权限漏斗）。
+* **桌面下滑拉出控制中心/通知**：`StatusBarTouchController.canInterceptTouch()` 最后一句是
+  `return SystemUiProxy.INSTANCE.get(mLauncher).isActive();`，null proxy 下恒 false ⇒ 触摸流连拦截
+  都进不去。桥接新增 `SystemUiProxy#isActive`（仅在 proxy 为 null 时改写为 true）与
+  `SystemUiProxy#onStatusBarTouchEvent`（proxy 为 null 时改调
+  `StatusBarManager.expandSettingsPanel(null)` / `expandNotificationsPanel()`）两个 hook，并放行
+  `android.permission.EXPAND_STATUS_BAR`。阈值 `CONTROL_CENTRE_TRAVEL_PX = 240f`，按**转发触摸流**
+  的位移算（原厂会把 slop 之后的第一帧改写成 `ACTION_DOWN` 再转发，所以起点已在屏幕中段）：
+  真机实测屏幕拖动 300–550 px → 通知栏、≥ 约 570 px → 控制中心；每次抬手打一行
+  `swipe down: downY=… travel=…px -> control centre|notifications`（`adb logcat -s AXMOTO:*`）。
+  因为 SystemUI 的 `ISystemUiProxy` 不是系统服务、拿不到 binder，C-lite 下无法像原厂那样逐帧
+  转发做跟手拖动，只能在抬手时二选一展开。
+* **`Utilities#isSleepScreenEnabled` 兜底 hook**：只在 `put_display_to_sleep` 完全**未设置**（读到
+  null）时放开，已有设置值时保持原厂语义 —— 本机实测原厂值就是 `"1"`，所以这层是纯兜底
+  （也能解释「`settings get global put_display_to_sleep` 为 null 但双击照样坏」的现象：原厂是
+  从 `MotorolaSettings` 自己的 provider 读的）。
+* **默认模式/正常绑定不受影响**：4 个 hook 只装在 `com.motorola.launcher3` 进程，且每个都先检查
+  `mSystemUiProxy`（读不到字段则视为「有代理」，保持原厂路径）；`isActive` 只在 false 时改写。
+* 详细机制、阈值实测表与验证步骤见 [`docs/C-LITE.md`](docs/C-LITE.md) 第 8 节。
+* **版本**：`module.prop` 的 `version=v1.2.1`、`versionCode=4`，发布 zip 变为
+  `dist/AxionRecents-v1.2.1.zip`；桥接 APK 的 `versionCode` / `versionName` 也由
+  `helper/build-helper.ps1` 从 `module.prop` 自动同步（本次 = `4` / `1.2.1`）。
+
 ## v1.2 — C-lite 开关并入 LSPosed + payload 换 release 变体
 
 第三个公开发布版。默认行为不变（Axion 同时当桌面和最近任务），C-lite 的**切换方式**从

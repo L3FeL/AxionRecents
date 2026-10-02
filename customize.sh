@@ -3,7 +3,10 @@
 # Keep it defensive: no command here may abort the installation.
 ui() { if command -v ui_print >/dev/null 2>&1; then ui_print "$*"; fi; }
 
-ui "- Axion Recents v1.2: installing (tmpfs mirror of priv-app + permissions, Axion package, static RRO)"
+# Version string for the banner comes from module.prop, so it can never go stale.
+MODVER="$(sed -n 's/^version=//p' "$MODPATH/module.prop" 2>/dev/null | head -n 1)"
+[ -n "$MODVER" ] || MODVER="(unknown version)"
+ui "- Axion Recents $MODVER: installing (tmpfs mirror of priv-app + permissions, Axion package, static RRO)"
 ui "- Default mode needs no configuration: reboot and the stacked recents are live."
 ui "- Optional C-lite mode (stock Moto launcher keeps HOME, Axion only serves recents):"
 ui "  enable 'Axion Desktop Bridge' in LSPosed (scope: system framework + Moto launcher) and reboot."
