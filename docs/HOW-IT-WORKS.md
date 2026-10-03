@@ -70,13 +70,27 @@ PMS 只在开机时按 `config_recentsComponentName` 算一次“recents 包”�
 对应地，**回原厂桌面就是停用模块 + 重启**：那时我们的 RRO 不存在，`MANAGE_ACTIVITY_TASKS`
 自然回到 `com.motorola.launcher3`。
 
-## 4. 两道安全网
+## 4. 安全网（v1.2.2 起只剩“记录 + 交还 HOME”）
 
-* **开机计数 / 熔断**（`post-fs-data.sh`）：每次模块生效的开机 +1，只有上一次开机被判定健康
-  才清零。连续 3 次不健康就自动写 `disable` 并跳过所有挂载 ⇒ 下次重启自动回原厂。
-  （健康判定不看 `sys.boot_completed`：曾出现 boot_completed 之后 SystemUI 才崩的情况。）
-* **崩溃循环看门狗**（`service.sh`）：开机后 160 s 窗口里统计 launcher / SystemUI 崩溃与
-  桌面进程存活；判定崩溃循环就把 HOME 还给原厂桌面、停用模块，并安排一次自动重启到干净状态。
+**历史**：v1.2.1 及更早有两道自动安全网 —— `post-fs-data.sh` 的开机计数/熔断（连续 3 次
+不健康就写 `disable` 并跳过全部挂载）与 `service.sh` 的崩溃循环看门狗（判定崩溃循环就把
+HOME 还给原厂、写 `disable`、并自动重启一次）。2026-10-03 真机上第二道误判过一次：C-lite
+下原厂桌面在开机早期重建进程换了 pid，看门狗单次 `pidof` 取不到就判成崩溃循环，于是写了
+`disable` + `_crashloop` 并自动重启，此后每次开机 `post-fs-data.sh` 都再写一次 `disable`
+⇒ KernelSU 里永远显示「未启用」。**v1.2.2 已把这两道自动动作全部删除。**
+
+现在的行为：
+
+* **每个模块生效的开机都照常挂载**（`post-fs-data.sh` 不再读健康标记/开机计数，也不写 `disable`；
+  它只负责清理遗留的 `_bootcount` / `_rebooted` / `_crashloop`，并在发现 `$MODDIR/disable` 时
+  在日志里提示用户去 KernelSU 里重新启用。`customize.sh` 在安装时删除遗留标记与 `disable`）。
+* **看门狗只观察 + 记录**（`service.sh` 的 `watchdog` / `watchdog_clite` / `watchdog_passive`）：
+  崩溃计数、进程缺失都只打 `WARN` 行，不再 `return 1`、不再停用模块、不再自动重启。
+* **唯一的救急动作**是 `restore_stock_home()`：FATAL 情况下把 HOME 交回
+  `com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher` 并写
+  `/data/adb/axion_recents_needs_attention`（提示需要人工看一眼），模块本身保持启用。
+* 要停用模块：在 KernelSU 管理器里手动关掉（或删 `/data/adb/modules/axion_recents/`）+ 重启。
+  代价是：如果 payload 真的导致桌面起不来，模块不会再自我停用，需要用户手动介入。
 
 日志落在 `/data/adb/axion_recents.log` 与 `/data/adb/axion_recents_diag.log`。
 
@@ -143,5 +157,5 @@ Axion 的牌堆布局里，`AxStackLayout.TASK_PRELOAD_RANGE = 5`（`isDistanceA
 
 `post-fs-data.sh` 会检查这个文件是否存在（8339 字节）来判定“RRO 已就位”。如果它被拿掉、
 而模块仍然启用，就会出现 **HOME 归 Axion、recents 仍归原厂** 的不一致状态 ⇒ Axion 桌面缺
-`MANAGE_ACTIVITY_TASKS` ⇒ 崩溃循环 ⇒ 看门狗回滚并停用模块。正常安装不会缺这个文件；
-`tools/build-zip.ps1` 的自检也会断言它在 zip 里。
+`MANAGE_ACTIVITY_TASKS` ⇒ 崩溃循环（v1.2.2 起看门狗只会把这次开机记进日志，不再自动回滚或
+停用模块，需要手动处理）。正常安装不会缺这个文件；`tools/build-zip.ps1` 的自检也会断言它在 zip 里。

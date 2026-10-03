@@ -5,7 +5,7 @@
 
 ![堆叠式后台](docs/screenshot.png)
 
-模块 ID `axion_recents` · 当前版本 **v1.2.1** · 作者 **L3FeL** · 许可 **GPL-3.0**
+模块 ID `axion_recents` · 当前版本 **v1.2.2** · 作者 **L3FeL** · 许可 **GPL-3.0**
 
 ## 实现方式
 
@@ -13,9 +13,10 @@
    进 `/system_ext/priv-app/AxionLauncher3/`、`/system_ext/etc/permissions/` —— 原厂文件一个字节都不动。
 2. 静态框架 RRO（`priority 100`）把 `android:string/config_recentsComponentName` 指到
    `com.android.launcher3/com.android.quickstep.RecentsActivity`。
-3. `service.sh` / `boot-completed.sh` 确认 RRO 生效后把 HOME 角色交给 Axion 桌面，并持续自检：
-   连续 3 次开机没留下健康标记就自动停用（熔断），160 s 内判定桌面崩溃循环就回滚 + 重启。
-   日志：`/data/adb/axion_recents.log`。
+3. `service.sh` / `boot-completed.sh` 确认 RRO 生效后把 HOME 角色交给 Axion 桌面，并持续自检
+   （观察桌面/SystemUI 是否崩溃循环）。**v1.2.2 起所有自愈动作都已删除**：异常只写日志与
+   `/data/adb/axion_recents_needs_attention` 标记，模块**不会**再自动停用自己、不会跳过挂载、
+   不会自动重启 —— 是否停用由你在 KernelSU 管理器里决定。日志：`/data/adb/axion_recents.log`。
 4. C-lite 靠模块自带的 LSPosed 桥接（`extras/motodesktop-helper.apk`）：替仍当 HOME 的原厂桌面放行
    AOSP 只授予 recents 组件的 `recents` 标志权限，并补上 C-lite 下失效的两个桌面手势。
 
@@ -47,6 +48,8 @@
 
 * 仅在 Motorola Android 16 / SDK 36、原厂桌面为 `com.motorola.launcher3` 的机型上实测，测试环境：KernelSU v3.3.0，LSPosed (API 102)。
 * 默认模式下原厂桌面在模块生效期间不可用。
+* **模块不会自我保护**（v1.2.2 起删除了自动停用/回滚）：如果开机后桌面起不来，请自己在 KernelSU 里停用
+  `axion_recents`（或删掉 `/data/adb/modules/axion_recents/`）后重启，并查看 `/data/adb/axion_recents.log`。
 * 模块脚本、RRO 源码、桥接由 AI 生成。
 
 ## 许可 / 致谢

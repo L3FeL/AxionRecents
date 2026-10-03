@@ -8,9 +8,10 @@
 # com.android.launcher3/*），而不是 post-fs-data 写下的 /data/adb/axion_recents_rro_ok ——
 # 那个标记只表示“模块树里备好了那份 RRO”，metamodule 灌注 /product/overlay 更晚。
 #
-# 关键安全网（v1.4 新增）：如果 com.android.launcher3 没起来（或者起来后立刻崩），说明
-# recents 配置已指向它、而承载 QuickStep 的包不可用 —— 此时唯一安全的动作是停用模块，
-# 让用户重启回到原厂桌面。日志里会写清楚。
+# 关键安全网（v1.4 新增，v1.2.2 改写）：如果 com.android.launcher3 没起来（或者起来后立刻崩），
+# 说明 recents 配置已指向它、而承载 QuickStep 的包不可用 —— 此时把 HOME 交还原厂桌面，让设备
+# 本次开机仍然可用，并把原因写进日志（/data/adb/axion_recents.log）与 needs_attention 标记。
+# **v1.2.2 起本脚本不再自动停用模块、不再写 disable、不再自动重启**（那次真机误判的教训）。
 MODDIR=${0%/*}
 LOG=/data/adb/axion_recents.log
 PRIV=/system_ext/priv-app
@@ -23,6 +24,8 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [service] $*" >> "$LOG" 2>/dev/null; 
 
 # ---------------------------------------------------------------------------
 # v1.7 崩溃循环熔断（v1.6 真机事故的直接修复）
+#   ⚠ v1.2.2：下面第 ③④ 步（写 disable / crashloop 标记、一次性自动重启）以及
+#     三个看门狗函数里的“不健康 ⇒ ax_rollback”已全部删除。看门狗现在只观察 + 记录日志。----
 #   事故：v1.6 的 payload 在 Android 16 上抛
 #     java.lang.NoClassDefFoundError: Lcom/android/window/flags/Flags;
 #   桌面被设为 HOME 后反复崩溃、system_server 跟着重启、负载飙到 ~25，
@@ -87,7 +90,7 @@ HEALTHY=/data/adb/axion_recents_healthy
 # "Can't find service: role" ⇒ 脚本误判成“Axion 不是 HOME 持有者”走了被动分支，
 # 只写了 disable（下次开机才生效），本次开机继续崩。现在 boot-completed.sh / 本脚本
 # 在授到 HOME 后写这个标记，判定 HOME 归属时把“role 服务取不到 + 标记在 + 我们的
-# launcher 在跑”也算作持有者 ⇒ 主动看门狗会真正回滚（还原原厂 HOME + 重启）。
+# launcher 在跑”也算作持有者（历史行为：主动看门狗会真正回滚；v1.2.2 起只记录日志）。
 HOME_GRANTED=/data/adb/axion_recents_home_granted
 
 watchdog() {
@@ -113,15 +116,13 @@ watchdog() {
             am force-stop com.motorola.launcher3 >> "$LOG" 2>&1
         fi
         if [ "$c1" -ge 2 ] || [ "$miss" -ge 2 ]; then
-            log "watchdog: UNHEALTHY - the Axion launcher is crash-looping"
-            return 1
+            log "watchdog: WARN - the Axion launcher looks crash-looping (log-only since v1.2.2: no disable, no rollback, no reboot)"
         fi
         if [ "$s1" -ge 3 ]; then
-            log "watchdog: UNHEALTHY - SystemUI is crash-looping ($s1 crashes in this boot)"
-            return 1
+            log "watchdog: WARN - SystemUI is crash-looping ($s1 crashes in this boot) (log-only since v1.2.2)"
         fi
     done
-    log "watchdog: healthy after $((i * 20))s (pid=${p1:-none} launcher_crashes=${c1:-0} systemui_crashes=${s1:-0})"
+    log "watchdog: window finished after $((i * 20))s (pid=${p1:-none} launcher_crashes=${c1:-0} systemui_crashes=${s1:-0}; check the WARN lines above, if any)"
     date '+%Y-%m-%d %H:%M:%S' > "$HEALTHY"
     rm -f /data/adb/axion_recents_bootcount /data/adb/axion_recents_rebooted
     return 0
@@ -146,27 +147,24 @@ watchdog_clite() {
         c1=$(ax_crashes); s1=$(ax_sui_crashes)
         log "watchdog(c-lite): t=${i}x20s axion=${p1:-none} moto=${m1:-none} launcher_crashes=$c1 systemui_crashes=$s1"
         if [ -z "$p1" ]; then
-            log "watchdog(c-lite): UNHEALTHY - the Axion quickstep process is not running"
-            return 1
+            log "watchdog(c-lite): WARN - no Axion quickstep pid at this sample (log-only; transient misses are normal)"
         fi
         if [ -z "$m1" ]; then
-            log "watchdog(c-lite): UNHEALTHY - the stock HOME process is not running"
-            return 1
+            log "watchdog(c-lite): WARN - no stock HOME pid at this sample (log-only; the system restarts HOME by itself)"
         fi
         if [ "$c1" -ge 2 ] || [ "$s1" -ge 3 ]; then
-            log "watchdog(c-lite): UNHEALTHY - crash loop (launcher=$c1 systemui=$s1)"
-            return 1
+            log "watchdog(c-lite): WARN - crash loop (launcher=$c1 systemui=$s1) (log-only since v1.2.2)"
         fi
     done
-    log "watchdog(c-lite): healthy after $((i * 20))s (axion=${p1:-none} moto=${m1:-none} launcher_crashes=${c1:-0} systemui_crashes=${s1:-0})"
+    log "watchdog(c-lite): window finished after $((i * 20))s (axion=${p1:-none} moto=${m1:-none} launcher_crashes=${c1:-0} systemui_crashes=${s1:-0}; check the WARN lines above, if any)"
     date '+%Y-%m-%d %H:%M:%S' > "$HEALTHY"
     rm -f /data/adb/axion_recents_bootcount /data/adb/axion_recents_rebooted
     return 0
 }
 
 # v1.9 被动看门狗：探针模式 / SKIP 分支（Axion 不是 HOME 持有者）下用。
-# 这里不期待 launcher 存活，只观察 SystemUI；结论同样写健康标记，否则守卫会把
-# 这次“本来安全的开机”算成失败，下一次就不敢挂载了。
+# 这里不期待 launcher 存活，只观察 SystemUI；结论写健康标记（仅作诊断记录 ——
+# v1.2.2 起 post-fs-data 的守卫已删除，标记不再影响下次开机是否挂载）。
 watchdog_passive() {
     s0=$(ax_sui_crashes)
     log "watchdog(passive): start (systemui_crashes=$s0, no launcher expected)"
@@ -177,38 +175,29 @@ watchdog_passive() {
         s1=$(ax_sui_crashes)
         log "watchdog(passive): t=${i}x20s systemui_pid=$(pidof com.android.systemui) moto=$(pidof com.motorola.launcher3) systemui_crashes=$s1"
         if [ "$s1" -ge 3 ]; then
-            log "watchdog(passive): UNHEALTHY - SystemUI is crash-looping even without our recents/HOME takeover"
-            return 1
+            log "watchdog(passive): WARN - SystemUI is crash-looping even without our recents/HOME takeover ($s1 crashes) (log-only since v1.2.2)"
         fi
     done
-    log "watchdog(passive): healthy after $((i * 20))s (systemui_crashes=${s1:-0})"
+    log "watchdog(passive): window finished after $((i * 20))s (systemui_crashes=${s1:-0}; check the WARN lines above, if any)"
     date '+%Y-%m-%d %H:%M:%S' > "$HEALTHY"
     rm -f /data/adb/axion_recents_bootcount /data/adb/axion_recents_rebooted
     return 0
 }
 
-ax_rollback() {
-    dump_diag "rollback"
-    log "ROLLBACK: restoring the stock launcher and disabling this module"
-    log "  overlay : $(cmd overlay disable com.axion.recents.overlay 2>&1)"
+# --- v1.2.2：原来的 ax_rollback() 已删除 ---------------------------------------------
+# 它做的是「关 RRO → HOME 还原厂 → touch disable + crashloop 标记 → 自动重启」。真机误判
+# 一次之后确认这套自愈的代价大于收益（模块被永久停用、用户也看不出原因）。现在只留一个
+# "本次开机把 HOME 交还原厂桌面"的救急函数：不写 disable、不写 crashloop、不重启、不停用模块。
+restore_stock_home() {
+    log "HOME(restore): HOME -> com.motorola.launcher3 (this boot only; the module stays enabled)"
     log "  set-home: $(cmd package set-home-activity --user 0 com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher 2>&1)"
+    sleep 2
     log "  start   : $(am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>&1 | tr '\n' ' ')"
     sleep 3
     log "  HOME    : $(cmd role get-role-holders --user 0 android.app.role.HOME 2>&1 | tr '\n' ' ')"
     log "  moto pid: $(pidof com.motorola.launcher3 2>&1)"
-    touch "$MODDIR/disable"
-    date '+%Y-%m-%d %H:%M:%S' > /data/adb/axion_recents_crashloop
-    log "  wrote $MODDIR/disable and /data/adb/axion_recents_crashloop"
-    log "  NOTE: post-fs-data.sh will skip ALL mounts while the crashloop marker exists"
-    if [ ! -f /data/adb/axion_recents_rebooted ]; then
-        date '+%Y-%m-%d %H:%M:%S' > /data/adb/axion_recents_rebooted
-        log "  one-shot reboot to a clean stock state"
-        sync
-        sleep 2
-        reboot
-    else
-        log "  already rebooted once for this payload - leaving the device on stock without another reboot"
-    fi
+    date '+%Y-%m-%d %H:%M:%S' > /data/adb/axion_recents_needs_attention
+    log "  wrote /data/adb/axion_recents_needs_attention (no disable, no reboot)"
 }
 
 # v1.9 全程 logcat 环形记录 —— 必须在 boot_completed **之前**就开始：
@@ -314,8 +303,9 @@ if [ -n "$BRIDGE_LOG" ] && [ -n "$BOOT_ID" ]; then
 fi
 # v2.0：boot-completed.sh 要带退避地重建原厂桌面进程、确认补丁真的进了进程（最多 12 轮 ≈ 4.4 分钟）
 # 才算把 C-lite 建立起来；而本脚本的健康看门狗跟它的探测循环是**并发**的。早先看门狗只用 160 秒
-# 就判定“原厂桌面没起来”并 ax_rollback（写 disable + 自动重启），把还没跑完的探测直接打断 —— 18:45
-# 那次开机就是这么挂的。所以先等 boot-completed settle（CLITE_STATE 写成 ok / failed），最多等 5 分钟。
+# 就判定“原厂桌面没起来”并回滚（当时会写 disable + 自动重启），把还没跑完的探测直接打断 —— 18:45
+# 那次开机就是这么挂的（v1.2.2 起看门狗只记录日志，不会再打断探测）。所以先等 boot-completed
+# settle（CLITE_STATE 写成 ok / failed），最多等 5 分钟。
 CLITE_STATE=/data/adb/axion_recents_clite_state
 if [ "$clite" = "1" ]; then
     w=0
@@ -390,15 +380,10 @@ else
     if [ -z "$apid" ]; then
         log "FATAL: com.android.launcher3 is not running after the HOME grant"
         log "       restoring the stock launcher as HOME so the device stays usable without a reboot"
-        log "set-home  : $(cmd package set-home-activity --user 0 com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher 2>&1)"
-        sleep 2
-        log "home start: $(am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>&1 | tr '\n' ' ')"
-        sleep 3
-        log "HOME      : $(cmd role get-role-holders --user 0 android.app.role.HOME 2>&1 | tr '\n' ' ')"
-        log "moto pid  : $(pidof com.motorola.launcher3 2>&1)"
-        log "       disabling this module - REBOOT to unload the priv-app mirror and the overlay"
-        cmd overlay disable com.axion.recents.overlay >> "$LOG" 2>&1
-        touch "$MODDIR/disable"
+        dump_diag "axion launcher missing"
+        restore_stock_home
+        log "       (v1.2.2) the module is NOT disabled automatically: $MODDIR/disable is untouched."
+        log "       Disable axion_recents in the KernelSU manager and reboot if you want stock for good."
     fi
     log "done"
 fi
@@ -407,12 +392,12 @@ fi
 # 只在 Axion 真的是 HOME 持有者时才用“launcher 存活”口径观察；否则“取不到 pid”
 # 本来就是正常状态（探针模式 / SKIP 分支下原厂桌面继续持有 HOME，Axion 只是被安装进来）。
 # 这一段覆盖了 v1.6 漏掉的那条路径：即使 `cmd overlay lookup` 因为 system_server
-# 正在重启而失败、脚本走了 SKIP 分支，只要 HOME 已经在 Axion 手里，照样观察+回滚。
+# 正在重启而失败、脚本走了 SKIP 分支，只要 HOME 已经在 Axion 手里，照样观察（v1.2.2 起只记日志）。
 dump_diag "before watchdog"
 # v1.10: HOME 归属判定要能扛住 system_server 重启（`cmd role` 会返回
 # "Can't find service: role"）。此时若本开机我们写下了 home_granted 标记、而且我们的
-# launcher 进程确实在跑，就按“Axion 是 HOME 持有者”处理 ⇒ 走主动看门狗，崩溃循环会被
-# 真正回滚（还原原厂 HOME + disable + 重启），而不是只写一个下次开机才生效的 disable。
+# launcher 进程确实在跑，就按“Axion 是 HOME 持有者”处理 ⇒ 走主动看门狗。
+# v1.2.2：主动看门狗只记录 WARN，不再回滚/写 disable。
 ax_is_home=0
 if cmd role get-role-holders --user 0 android.app.role.HOME 2>/dev/null | grep -q com.android.launcher3; then
     ax_is_home=1
@@ -421,65 +406,81 @@ elif [ -f "$HOME_GRANTED" ] && [ -n "$(pidof com.android.launcher3)" ]; then
     ax_is_home=1
 fi
 # v2.0 C-lite：HOME 留在原厂桌面，Axion 只当 recents —— 判据是“两个进程都活着 + 没有崩溃循环”，
-# 绝不 force-stop 原厂桌面；失败时照旧全量回滚（还原原厂 HOME、disable、重启）。
+# 绝不 force-stop 原厂桌面；v1.2.2 起单次采样异常只写日志（真机误判过 pidof 取不到原厂桌面）。
 if [ "$clite" = "1" ]; then
     log "=== crash-loop watchdog (c-lite: HOME = com.motorola.launcher3, Axion = recents, 160s window) ==="
-    if watchdog_clite; then
-        dump_diag "c-lite watchdog healthy"
-    else
-        dump_diag "c-lite watchdog unhealthy"
-        ax_rollback
-    fi
+    watchdog_clite
+    dump_diag "c-lite watchdog done"
 elif [ "$ax_is_home" = "1" ]; then
     log "=== crash-loop watchdog (HOME holder = com.android.launcher3, 160s window) ==="
-    if watchdog; then
-        dump_diag "watchdog healthy"
-    else
-        dump_diag "watchdog unhealthy"
-        ax_rollback
-    fi
+    watchdog
+    dump_diag "watchdog done"
 else
     log "watchdog: passive - com.android.launcher3 is not the HOME role holder (probe / SKIP branch)"
-    if watchdog_passive; then
-        dump_diag "passive healthy"
-    else
-        dump_diag "passive unhealthy"
-        if [ -f "$HOME_GRANTED" ]; then
-            log "PASSIVE FAIL: HOME was granted to Axion this boot -> full rollback (restore stock HOME, disable, reboot)"
-            ax_rollback
-        else
-            log "PASSIVE FAIL: SystemUI crash-loops even with only our priv-app mirror mounted"
-            log "             -> disabling the module (no auto reboot needed: recents/HOME were never taken)"
-            touch "$MODDIR/disable"
-            date '+%Y-%m-%d %H:%M:%S' > /data/adb/axion_recents_crashloop
-        fi
-    fi
+    watchdog_passive
+    dump_diag "passive watchdog done"
 fi
 # v1.2 维护阶段：桥接 APK 由模块自己安装/升级，用户不需要再手动 `pm install`。
-# 判据是内容哈希：已装的那份和 extras/ 里的一致就什么都不做（免得每次开机都替换包，让 LSPosed
-# 重新加载模块）。必须用 `pm install -r`；**不要**用 adb install 的增量安装（路径会变得不可预测）。
+# v1.2.2：判据是 helper.prop 里的 versionCode（**不是**内容哈希）：只有桥接真的更新了才重装。
+# 原因是重装会换掉 APK 的 /data/app 路径，而 LSPosed 记的是旧路径（modules_config.db）——
+# 路径一失效它就静默跳过这个模块、C-lite 静默失效（HOME 回到 Axion），所以没必要时绝不能重装。
+# 必须用 `pm install -r`；**不要**用 adb install 的增量安装（路径会变得不可预测）。
 HELPER_SRC="$MODDIR/extras/motodesktop-helper.apk"
 HELPER_PKG=com.axion.motodesktop
+HELPER_PROP="$MODDIR/helper.prop"
+LSPD_DB=/data/adb/lspd/config/modules_config.db
+
+helper_want_version() { sed -n 's/^versionCode=//p' "$HELPER_PROP" 2>/dev/null | head -n 1; }
+helper_have_version() { pm dump "$HELPER_PKG" 2>/dev/null | sed -n 's/.*versionCode=\([0-9][0-9]*\).*/\1/p' | head -n 1; }
+helper_installed_path() { pm path "$HELPER_PKG" 2>/dev/null | head -1 | sed 's/^package://'; }
+
+# LSPosed caches the path of the bridge APK. After a re-install the cached path is gone and LSPosed
+# silently skips the module - no error anywhere, C-lite just stops working. The device has no
+# sqlite3, so the module cannot repair modules_config.db itself: it can only shout about it.
+check_lsposed_path() {
+    [ -f "$LSPD_DB" ] || return 0
+    cached=$(grep -a -o '/data/app/[^/]*/com\.axion\.motodesktop-[^/]*/base\.apk' "$LSPD_DB" 2>/dev/null | sort -u)
+    [ -n "$cached" ] || return 0
+    actual=$(helper_installed_path)
+    [ -n "$actual" ] || return 0
+    stale=""
+    for p in $cached; do
+        [ "$p" = "$actual" ] || stale="${stale}${p} "
+    done
+    [ -z "$stale" ] && return 0
+    log "  WARNING: LSPosed cached a stale bridge path and will keep skipping the module:"
+    for p in $stale; do log "    cached : $p"; done
+    log "    actual : $actual"
+    log "    fix    : open LSPosed, switch '$HELPER_PKG' off and on, then reboot"
+    date > /data/adb/axion_recents_needs_attention 2>/dev/null
+    return 0
+}
+
 ensure_helper_installed() {
     [ -f "$HELPER_SRC" ] || { log "helper: $HELPER_SRC missing in the module - skipping"; return 0; }
-    sum_src=$(sha256sum "$HELPER_SRC" 2>/dev/null | cut -d' ' -f1)
-    have=$(pm path "$HELPER_PKG" 2>/dev/null | head -1 | sed 's/^package://')
-    sum_have=""
-    [ -n "$have" ] && sum_have=$(sha256sum "$have" 2>/dev/null | cut -d' ' -f1)
-    if [ -n "$sum_src" ] && [ "$sum_src" = "$sum_have" ]; then
+    want=$(helper_want_version)
+    have=$(helper_have_version)
+    at=$(helper_installed_path)
+    if [ -n "$at" ] && [ -n "$want" ] && [ -n "$have" ] && [ "$have" -ge "$want" ]; then
+        log "helper: $HELPER_PKG v$have already installed at $at (module ships v$want) - untouched"
+        check_lsposed_path
         return 0
     fi
-    if [ -n "$have" ]; then
-        log "helper: updating $HELPER_PKG ($have ${sum_have:-?} -> ${sum_src:-?})"
+    if [ -n "$at" ]; then
+        log "helper: updating $HELPER_PKG (v${have:-?} at $at -> module v${want:-?})"
     else
-        log "helper: installing $HELPER_PKG from $HELPER_SRC"
+        log "helper: installing $HELPER_PKG (module v${want:-?}) from $HELPER_SRC"
     fi
     log "  pm install : $(pm install -r -d "$HELPER_SRC" 2>&1 | tr '\n' ' ')"
-    have2=$(pm path "$HELPER_PKG" 2>/dev/null | head -1 | sed 's/^package://')
-    log "  installed  : ${have2:-<none>}"
-    if [ -n "$have2" ] && [ "$(sha256sum "$have2" 2>/dev/null | cut -d' ' -f1)" != "$sum_src" ]; then
-        log "  WARNING: the installed helper still differs from the module copy - reinstall from KernelSU"
+    have2=$(helper_have_version)
+    at2=$(helper_installed_path)
+    log "  installed  : ${at2:-<none>} (v${have2:-?})"
+    if [ -z "$at2" ]; then
+        log "  WARNING: $HELPER_PKG is still not installed - install it manually and reboot"
+    elif [ -n "$want" ] && [ "${have2:-0}" -lt "$want" ] 2>/dev/null; then
+        log "  WARNING: the installed helper is still older than the module copy (v$have2 < v$want)"
     fi
+    check_lsposed_path
     log "  NOTE: enable $HELPER_PKG in LSPosed (scope: system framework + Moto launcher) and reboot for C-lite"
 }
 

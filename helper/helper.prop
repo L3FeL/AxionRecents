@@ -1,0 +1,13 @@
+# Version of the LSPosed bridge APK (com.axion.motodesktop), used by C-lite mode.
+#
+# Bump these ONLY when Main.java / res / assets of the bridge change - never just because the
+# module release changed. build-helper.ps1 reads this file (not ../module.prop), customize.sh and
+# service.sh compare the installed versionCode against it, and only reinstall the APK when the
+# installed copy is older.
+#
+# Why this matters: every reinstall gives the APK a new /data/app/~~<random>/... path, while
+# LSPosed keeps loading the path recorded in /data/adb/lspd/config/modules_config.db. When that
+# path disappears LSPosed silently skips the module and C-lite stops working (no error anywhere).
+# See docs/C-LITE.md.
+version=1.2.2
+versionCode=5

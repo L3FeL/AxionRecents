@@ -1,5 +1,59 @@
 # Changelog
 
+## v1.2.2 — 删除「自动停用/熔断/自动回滚」机制（真机误判修复）
+
+v1.2.1 的 bug 修复版：功能与 v1.2.1 完全一致，只删掉模块的自我保护机制，并把误判留下的
+`disable` 标记自动清理掉。
+
+* **事故**：2026-10-03 开机后模块正常挂载并进入 C-lite（11:19:18 探测 `moto pid=13057
+  focused=1 crashes=0 patch_loaded=2`，健康标记已写）。11:20:57 C-lite 看门狗的一次采样里
+  `pidof com.motorola.launcher3` 恰好为空（原厂桌面在开机早期本来就会因重建进程而换 pid：
+  7849 → 12217 → 13057，最后一次才拿到 LSPosed 补丁），看门狗把它判成「原厂桌面进程不在」
+  ⇒ `ax_rollback()` 关 RRO（静态 RRO 运行时关不掉，报 SecurityException，预期）、把 HOME
+  还原厂、写 `/data/adb/modules/axion_recents/disable` 与 `_crashloop` 标记，并**自动重启**。
+  重启后 `post-fs-data.sh` 见到 crashloop 标记就「跳过全部挂载」并**再写一次 disable** ⇒
+  KernelSU 里永远显示「未启用」，用户手动启用再重启也没有用（还必须同时删掉 `_bootcount`，
+  否则下一次守卫仍会停用）。那一次采样 `launcher_crashes=0 systemui_crashes=0`、无 tombstone、
+  无 LMK 记录 —— 是纯误判。
+* **现在的口径**：**每次开机都照常挂载**。异常只写日志与
+  `/data/adb/axion_recents_needs_attention` 标记，绝不自己停用模块、绝不跳过挂载、绝不自动重启。
+  要停用模块请在 KernelSU 管理器里手动关掉（或删模块目录）再重启。
+* **删掉的东西**：`post-fs-data.sh` 的开机失败守卫（`HEALTHY`/`BOOTCOUNT` 判定 + `touch disable
+  + exit 0`）与 `_crashloop` 分支；`service.sh` 的 `ax_rollback()`（关 RRO + 还原 HOME + 写
+  disable/crashloop + `reboot`），三个看门狗函数（`watchdog` / `watchdog_clite` /
+  `watchdog_passive`）的不健康分支改成只打 `WARN` 行（原来会 `return 1` 触发回滚），FATAL
+  分支与被动分支里的 `touch "$MODDIR/disable"`、`cmd overlay disable` 移除；
+  `boot-completed.sh` 的 FATAL 分支同样改为「把 HOME 交还原厂 + 写 needs_attention + 退出」。
+* **新增**：`service.sh` 的 `restore_stock_home()`（把 HOME 交回
+  `com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher`、记 HOME 与 pid、
+  写 `needs_attention`；不写 disable、不重启）；`post-fs-data.sh` 每次开机清掉遗留的
+  `_bootcount` / `_rebooted` / `_crashloop` 标记，并在发现 `$MODDIR/disable` 时提示用户去
+  KernelSU 里重新启用；`customize.sh` 安装时删除遗留标记与 `disable` 文件（否则覆盖安装后
+  管理器里仍显示「未启用」）。
+* **代价（须知）**：如果 payload 真的导致桌面起不来，模块不会再自我停用，需要用户自己在
+  KernelSU 里停用模块（或删 `/data/adb/modules/axion_recents/`）后重启；日志里会留下
+  `needs_attention` 标记与原因行。我们选择这条路是因为自动停用已经在真机上误判过一次，
+  代价大于收益。
+* **顺带修掉一个静默失效**：`helper/AndroidManifest.xml` 里原来写死的 `versionCode` /
+  `versionName` 会**盖过** aapt2 link 的 `--version-code/--version-name`，所以「桥接版本自动
+  同步 module.prop」从来没真正生效（APK 里一直是旧值）。现已把这两个属性从 manifest 删掉。
+* **桥接 APK 版本独立**：新增 `helper/helper.prop`（`version` / `versionCode`）作为桥接的唯一
+  版本源；`helper/build-helper.ps1` 只读它，并把**实际烘焙进 APK** 的版本回写成
+  `helper/dist/motodesktop-helper.prop`，打包时以 `helper.prop` 放进模块根目录（本次 =
+  `1.2.2` / `5`）。以后只有改 `Main.java` 或桥接资源时才递增它，模块自己的版本怎么涨都不影响。
+* **不再无谓重装桥接（第二个 C-lite 静默失效的根因）**：每次 `pm install` 都会给 APK 换一个
+  `/data/app/~~<随机>/…` 路径，而 LSPosed 加载的是它自己在
+  `/data/adb/lspd/config/modules_config.db` 里记下的旧路径 —— 路径一失效它就**静默跳过**这个
+  模块：LSPosed 日志里一行 `AxionDesktopBridge` 都没有，`service.sh` 探针 `active=0`，于是这次
+  开机走默认模式（HOME 回到 Axion），C-lite 无声失效。本次真机就是这么坏的。
+  现在 `customize.sh` 与 `service.sh` 都只比较 `helper.prop` 的 `versionCode`：已装版本 ≥ zip 里
+  的版本就**原样不动**已装的 APK；只有真的需要重装时，才额外比对 LSPosed 缓存路径与
+  `pm path` 的实际路径，不一致就打印醒目 WARNING 并写 `needs_attention` 标记（设备上没有
+  `sqlite3`，模块改不了 LSPosed 的库），提示用户打开 LSPosed 把 `Axion Desktop Bridge`
+  关掉再打开、然后重启。详见 `docs/C-LITE.md` §6.2。
+* **版本**：`module.prop` 的 `version=v1.2.2`、`versionCode=5`，发布 zip 为
+  `dist/AxionRecents-v1.2.2.zip`。
+
 ## v1.2.1 — C-lite 下恢复原厂桌面的两个手势（双击桌面息屏 / 桌面下滑控制中心）
 
 v1.2 的 bug 修复版：没有新功能，默认模式（Axion 同时当桌面和最近任务）行为与 v1.2 完全一致，
@@ -71,6 +125,10 @@ v1.2 的 bug 修复版：没有新功能，默认模式（Axion 同时当桌面�
   `modules_state.enabled=1` + `scope` 两行，路径由 LSPosed 自己维护 —— v1.1 文档里
   「路径过期导致模块被静默跳过、必须重跑 `_clite_install.ps1`」的警告已过时。本地的
   `_tools/_clite_install.ps1` 现在只是命令行开关（`-Off` 关闭桥接），不在发布树里。
+  > **v1.2.2 更正**：这条**是错的**。当时那次"6 秒就同步"其实是同一次实验里手工重跑
+  > `_clite_install.ps1`（它会把模块开关重写一遍）造成的假象。真机复现的结果是：路径一旦
+  > 不存在，LSPosed 就**静默跳过**该模块，既不报错也不自愈 —— 详见 v1.2.2 段与
+  > `docs/C-LITE.md` §6.2。
 * **payload 换成 release 变体（方案 A）**：原厂系统侧的 launcher APK（`payload/AxionLauncher3.apk`）
   从 debug 换到 release —— 不再包含 LeakCanary（桌面图标库里的「Leaks」入口消失）、
   `android:debuggable` 为 false、应用名从 `Axion (Debug)` 变回 `Axion`；用同一个 release 签名密钥，

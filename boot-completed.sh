@@ -8,13 +8,13 @@
 #   signature|recents 的 MANAGE_ACTIVITY_TASKS。原厂 com.motorola.launcher3 因此
 #   失去该权限，它的 QuickstepLauncher 一启动就在 RecentsAnimationDeviceState.<init>
 #   抛 SecurityException（v1.2 实测的崩溃循环）。所以在同一次开机里必须把 HOME 交给
-#   com.android.launcher3；由 service.sh 负责在它起不来时自动停用模块。
+#   com.android.launcher3；由 service.sh 负责在它起不来时把 HOME 交还原厂并写日志。
 #
-# 安全分支：
+# 安全分支（v1.2.2 起不再自动停用模块 —— 见 post-fs-data.sh 顶部的说明）：
 #   * 忘记 pm enable：新出现的系统包可能被扫成 stopped。
 #   * 如果 PMS 根本没装上 com.android.launcher3（RRO 已指向它 = 没有包持有
-#     signature|recents ⇒ 原厂桌面会崩），立刻 touch disable 并尝试关掉我们的 RRO，
-#     让下一次重启回到原厂。
+#     signature|recents ⇒ 原厂桌面会崩），就把 HOME 交还原厂桌面、写 needs_attention 标记
+#     并退出；**不再 touch disable**，是否停用由用户在 KernelSU 里决定。
 MODDIR=${0%/*}
 LOG=/data/adb/axion_recents.log
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [boot-completed] $*" >> "$LOG" 2>/dev/null; }
@@ -35,10 +35,14 @@ fi
 pkg=$(pm path com.android.launcher3 2>&1)
 log "axion path: $pkg"
 if ! echo "$pkg" | grep -q 'AxionLauncher3.apk'; then
-    log "FATAL: com.android.launcher3 not installed from our package dir - disabling module"
-    log "       (recents config points at a missing package; reboot will restore stock)"
-    cmd overlay disable com.axion.recents.overlay >> "$LOG" 2>&1
-    touch "$MODDIR/disable"
+    log "FATAL: com.android.launcher3 not installed from our package dir"
+    log "       (recents config points at a missing package; giving HOME back to the stock launcher)"
+    log "  set-home: $(cmd package set-home-activity --user 0 com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher 2>&1)"
+    log "  start   : $(am start -a android.intent.action.MAIN -c android.intent.category.HOME 2>&1 | tr '\n' ' ')"
+    date '+%Y-%m-%d %H:%M:%S' > /data/adb/axion_recents_needs_attention
+    log "       wrote /data/adb/axion_recents_needs_attention"
+    log "       (v1.2.2) the module is NOT disabled automatically: $MODDIR/disable is untouched."
+    log "       Disable axion_recents in the KernelSU manager and reboot if you want stock for good."
     rm -f /data/adb/axion_recents_home_granted
     exit 0
 fi
@@ -100,12 +104,12 @@ if [ -n "$BRIDGE_LOG" ] && [ -n "$BOOT_ID" ]; then
     log "bridge probe: log=$BRIDGE_LOG boot_id=$BOOT_ID line_boot=${bridge_boot:-<none>} active=$bridge_active"
 fi
 HEALTHY=/data/adb/axion_recents_healthy
-BOOTCOUNT=/data/adb/axion_recents_bootcount
+BOOTCOUNT=/data/adb/axion_recents_bootcount   # v1.2.2 起没人再读它，保留只是为了清掉遗留文件
 CLITE_STATE=/data/adb/axion_recents_clite_state
 PATCH_PKG=com.axion.motodesktop
 if [ "$bridge_active" = "1" ]; then
     log "C-LITE MODE (bridge enabled in LSPosed): the stock Moto launcher keeps HOME, Axion only serves recents"
-    # 告诉 service.sh“切换正在进行”，别让它的健康看门狗在这里还没 settle 时就抢跑回滚（v2.0 踩过：
+    # 告诉 service.sh“切换正在进行”，别让它的健康看门狗在这里还没 settle 时就抢跑下结论（v2.0 踩过：
     # 看门狗 160 秒就下结论，而本探测最多要 12 轮 ≈ 4.4 分钟）。
     echo pending > "$CLITE_STATE"
     rm -f /data/adb/axion_recents_stock_home_kept
@@ -160,8 +164,8 @@ if [ "$bridge_active" = "1" ]; then
         date '+%Y-%m-%d %H:%M:%S' > /data/adb/axion_recents_stock_home_kept
         rm -f /data/adb/axion_recents_home_granted
         # 探测已经功能性验证过（原厂桌面主进程稳定 + 有焦点 + 没有新崩溃），等于本开机是健康的：
-        # 立刻补上健康标记，否则 post-fs-data 的崩溃守卫会把"还没等到 service.sh 看门狗写标记的正常开机"
-        # 判成失败，连续两次就 touch disable 停用整个模块（v2.0 重启验证踩过这个坑）。
+        # 补上健康标记（v1.2.2 起它只是诊断记录 —— post-fs-data 的崩溃守卫已删除，标记不再决定
+        # 下次开机是否挂载；历史上它曾用来防止守卫把"还没等到看门狗写标记的正常开机"判失败）。
         date '+%Y-%m-%d %H:%M:%S' > "$HEALTHY"
         rm -f "$BOOTCOUNT" /data/adb/axion_recents_rebooted
         echo "ok $(date '+%Y-%m-%d %H:%M:%S')" > "$CLITE_STATE"
@@ -196,7 +200,7 @@ if ! cmd role get-role-holders --user 0 android.app.role.HOME 2>/dev/null | grep
 fi
 log "HOME after : $(cmd role get-role-holders --user 0 android.app.role.HOME 2>&1 | tr '\n' ' ')"
 # v1.10: 记录“本开机 HOME 已在 Axion 手里”，供 service.sh 在 `cmd role` 因 system_server
-# 重启而失效时兜底判定 HOME 归属（否则看门狗会误走被动分支，只写下次开机才生效的 disable）。
+# 重启而失效时兜底判定 HOME 归属（否则看门狗会误走被动分支）。
 if cmd role get-role-holders --user 0 android.app.role.HOME 2>/dev/null | grep -q com.android.launcher3; then
     date '+%Y-%m-%d %H:%M:%S' > /data/adb/axion_recents_home_granted
     log "home_granted marker written"

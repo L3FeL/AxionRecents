@@ -63,9 +63,11 @@ UnsupportedOperationException: Tried to obtain display from a Context not associ
 
 桥接 APK 随模块 zip 分发，**刷入时会自动装好**：`customize.sh` 尽力执行
 `pm install -r -d "$MODPATH/extras/motodesktop-helper.apk"`（装不上也不中止刷入，下次开机重试）；
-之后 `service.sh` 每次开机都会调用 `ensure_helper_installed()`，比较
-`extras/motodesktop-helper.apk` 与已装 `pm path com.axion.motodesktop` 的 base.apk 的 sha256，
-不一致才 `pm install -r -d` 重装 —— 所以模块升级时桥接会**自动更新到 extras/ 里那一份**。
+之后 `service.sh` 每次开机都会调用 `ensure_helper_installed()`，读模块根目录的 `helper.prop`
+（由 `helper/build-helper.ps1` 从实际产物生成）拿到目标 `versionCode`，与设备上已装
+`com.axion.motodesktop` 的版本比较：**只有已装版本更低时才** `pm install -r -d` 重装。
+版本相同就原样不动 —— 这是有意的：重装会把 APK 换到新的 `/data/app/…` 路径，而 LSPosed
+缓存的旧路径随即失效、C-lite 会静默失效（§6.2）。
 刷完后它就在设备上 `/data/adb/modules/axion_recents/extras/motodesktop-helper.apk`
 （仓库里是 [`helper/`](../helper/)，可用 `helper/build-helper.ps1` 重建）。
 **不需要**手工 `pm install`。
@@ -159,12 +161,19 @@ adb -s <serial> reboot
 3. `service.sh`：先**等 boot-completed settle**（轮询 `_clite_state`，最多 20×15 s = 300 s；
    中途发现 HOME 已不是原厂桌面、或状态是 `failed`，就自己切回旧模式分支），然后才是
    C-lite 看门狗（8×20 s，只看 Axion quickstep 进程、原厂桌面进程、崩溃计数；
-   **绝不 force-stop 原厂桌面**），健康则写 `/data/adb/axion_recents_healthy`。
+   **绝不 force-stop 原厂桌面**），结束后写 `/data/adb/axion_recents_healthy`。
 
 > 为什么 `service.sh` 必须等：看门狗的观察窗口只有 160 s，而上面的探测最多要
 > 12 轮 ≈ 4.4 min，两者是**并发**的。早先看门狗在自己的 160 s 窗口里看不到原厂桌面进程
-> 就直接 `ax_rollback`（写 `disable` + 一键重启回原厂），把还没跑完的探测打断 —— 真机
+> 就回滚（当时会写 `disable` + 一键重启回原厂），把还没跑完的探测打断 —— 真机
 > 踩过一次（18:45 那次开机：探测跑到 #4 就被回滚掐了）。settle 状态文件把这两段串起来。
+
+> **v1.2.2：看门狗只记录，不再动手。** 2026-10-03 又一次真机事故把它彻底关掉了：C-lite 下
+> 原厂桌面在开机早期会因为重建进程而换 pid（7849 → 12217 → 13057），看门狗某一次采样恰好
+> `pidof` 为空，就判成「原厂桌面进程不在」并回滚 + 写 `disable` + 自动重启；此后每次开机
+> `post-fs-data.sh` 见 `_crashloop` 又写一次 `disable` ⇒ KernelSU 里永远显示"未启用"。
+> 现在三个看门狗函数只打 `WARN` 行；唯一的救急动作是 `restore_stock_home()`（把 HOME 交回
+> 原厂 + 写 `needs_attention` 标记，不停用模块、不重启）。
 
 > 为什么要"重建进程 + 检查补丁"而不是一次性判断：实测开机早期由系统拉起的原厂桌面进程
 > **拿不到** LSPosed 补丁（`patch_loaded=0`，uptime 41 s / 63 s / 86 s / 108 s …），要到
@@ -192,7 +201,7 @@ adb shell input keyevent 187                                                    
 [boot-completed]   probe #3 : moto pid=11010 focused=1 crashes=0 patch_loaded=2 uptime=91s
 [boot-completed] done (c-lite: HOME untouched, recents = com.android.launcher3, healthy marker written)
 [service] watchdog(c-lite): t=8x20s axion=3980 moto=11010 launcher_crashes=0 systemui_crashes=0
-[service] watchdog(c-lite): healthy after 160s (…)
+[service] watchdog(c-lite): window finished after 160s (…)
 ```
 
 ## 5. 已知代价 / 限制
@@ -205,11 +214,15 @@ adb shell input keyevent 187                                                    
   原厂桌面进程会因为同一处 `MANAGE_ACTIVITY_TASKS` 崩溃反复重启；`boot-completed` 会带退避地
   重建进程直到补丁真的进进程（最多 12 轮 ≈ 4.4 min），成功后即稳定。代价是开机的头几分钟
   桌面可能不可用，且 `service.sh` 的看门狗要等 settle 才开始计时。
-* **helper APK 由模块自己维护**：v1.2 起 `service.sh` 每次开机会核对 `extras/` 里那份与已装
-  `com.axion.motodesktop` 的 sha256，不一致就自动重装升级；LSPosed 也会**自动同步数据库里的
-  `apk_path`**（实测 `pm install -r` 之后约 6 秒就指到新的 base.apk）。所以重装/更新桥接之后
-  **不再需要**重跑 `_clite_install.ps1`。本地那个 `_tools/_clite_install.ps1` 现在只是命令行开关
-  （默认开启桥接，`-Off` 关闭），等价于在 LSPosed 管理器里点一下。
+* **helper APK 由模块自己维护**：v1.2.2 起 `service.sh` 每次开机读模块根目录的 `helper.prop`
+  （桥接自己的版本号），只有**已装版本低于**模块里那份时才重装；版本相同就原样不动。
+  v1.2 的做法是比对 sha256，但构建本身不可复现（同样的源码每次产出的 APK 字节都不同），
+  于是每次升级都会重装一次 —— 而每次重装都会把 APK 换到新的 `/data/app/~~…/` 路径，
+  LSPosed 缓存的旧路径随即失效，它会**静默跳过**这个模块、C-lite 无声失效
+  （v1.2 的更新日志里曾写"LSPosed 会自动同步 `apk_path`"，**实测并不会**，见 §6.2）。
+  所以现在：桥接版本不变 ⇒ 不重装 ⇒ 路径不动 ⇒ 升级模块不会影响 C-lite。
+  本地那个 `_tools/_clite_install.ps1` 现在只是命令行开关（默认开启桥接，`-Off` 关闭），
+  等价于在 LSPosed 管理器里点一下。
 * 系统 OTA / 重装 KernelSU 之后需要重新做第 2 步。
 
 ## 6. 回滚
@@ -222,8 +235,54 @@ adb shell input keyevent 187                                                    
 adb shell su -c 'cmd package set-home-activity com.motorola.launcher3/com.android.launcher3.CustomizationPanelLauncher'
 ```
 
+### 6.1 如果 KernelSU 里显示「未启用」/ 开关弹回去（v1.2.2 已修复根因）
+
+v1.2.1 及更早的模块会自己写 `/data/adb/modules/axion_recents/disable`（看门狗误判崩溃循环时的
+自愈动作），KernelSU 只要看到这个文件就认为模块被禁用 —— 于是开关看起来"点了没用"。
+v1.2.2 起模块**不再**写它，安装时（`customize.sh`）也会清掉遗留的那份。
+
+如果你手上是旧版误判后卡住的状态，手动清一次再重启即可（**4 个标记必须一起删**，
+漏掉 `_bootcount` 的话旧版的守卫会在下次开机再停用一次）：
+
+```bash
+adb shell su -c 'rm -f /data/adb/axion_recents_crashloop /data/adb/axion_recents_bootcount \
+  /data/adb/axion_recents_rebooted /data/adb/modules/axion_recents/disable'
+adb reboot
+```
+
+`/data/adb/axion_recents_needs_attention`（v1.2.2 新增）是"本次开机有异常、需要人工看一眼"
+的记录，不影响挂载，看到它时去 `/data/adb/axion_recents.log` 末尾找原因即可。
+
 `_tools\_clite_test2.sh`（快速回环：不重启，直接切 HOME 试原厂桌面）、
 `_tools\_clite_verify.sh`（开机后一次性打印全部判据）是同目录下的调试脚本。
+
+### 6.2 C-lite 突然失效 / HOME 自己回到 Axion（LSPosed 缓存了旧路径）
+
+**症状**：本来用得好好的，某次升级模块（或手动重装桥接 APK）并重启后：
+
+* KernelSU 里模块是启用状态，日志里挂载、RRO 判定都正常；
+* 但 HOME 变成了 Axion 桌面，最近任务也是 Axion 的（退回默认模式）；
+* `/data/adb/lspd/log/modules_*.log` 里**一行 `AxionDesktopBridge` 都没有**，
+  `service.sh` 的探针打 `not C-lite: no bridge handshake for this boot`。
+
+**原因**：LSPosed 把「第一次加载这个桥接 APK 的路径」记在
+`/data/adb/lspd/config/modules_config.db` 里。每次 `pm install` 都会给 APK 换一个
+`/data/app/~~<随机字符串>/com.axion.motodesktop-<随机字符串>/base.apk` 路径，旧目录随即被删。
+路径一旦不存在，LSPosed 就**静默跳过**这个模块 —— 不报错、不提示，C-lite 直接失效。
+（打开 LSPosed 管理器看一眼并不会刷新这条记录；设备上也没有 `sqlite3` 供模块脚本改写它。）
+
+**修法**（30 秒）：打开 LSPosed 管理器 → 找到 `Axion Desktop Bridge`（`com.axion.motodesktop`）
+→ 把开关**关掉再打开** → 重启。管理器这次会把新路径写回它的库，握手就恢复了。
+
+**v1.2.2 起模块自己会尽量避免这件事**：
+
+* 桥接 APK 有独立版本号（模块根目录的 `helper.prop`，由 `helper/build-helper.ps1` 从实际
+  产物生成）。`customize.sh` 与 `service.sh` 只在「已装版本 < zip 里的版本」时才重装，
+  所以**只改脚本/文档的版本升级不会碰桥接 APK，路径不动，C-lite 不受影响**；
+* 真的重装了桥接时，模块会比对 LSPosed 缓存路径与 `pm path` 的实际路径，不一致就打
+  `WARNING: LSPosed cached a stale bridge path ...` 并写
+  `/data/adb/axion_recents_needs_attention`，按上面那 30 秒步骤操作即可；
+* 只有 `Main.java` / 桥接资源真的变了（`helper.prop` 递增）才会发生一次重装。
 
 ## 7. 桌面不出现在最近任务里（build-77 起）
 
@@ -350,5 +409,5 @@ adb shell input tap 450 1750; adb shell input tap 450 1750   # 两次连点（23
 回归：最近任务键（187）与从桌面起手上滑仍进 Axion `com.android.launcher3/com.android.quickstep.RecentsActivity`，
 `logcat -b crash` 里 launcher/systemui 计数为 0；默认模式（桥接停用）行为不变。
 
-更新方式：换新 zip 刷入模块（`extras/motodesktop-helper.apk` 会在开机时自动覆盖安装旧桥接，
-见 §5），然后重启。
+更新方式：换新 zip 刷入模块（里面的桥接 APK 只有在**版本比已装的更高**时才会自动覆盖安装，
+见 §5），然后重启。只改模块脚本、没动桥接的版本升级**不会**碰桥接 APK，C-lite 不受影响。

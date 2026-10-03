@@ -52,7 +52,15 @@ privapp 白名单和 `pm grant` 都救不了（前者只对 `privileged` 标志�
 # 需要 Android SDK（build-tools 36 与 platforms/android-36）与 JDK 17+
 pwsh -File helper\build-helper.ps1 -SdkRoot "$env:ANDROID_SDK_ROOT" -JdkHome "$env:JAVA_HOME"
 # 输出：helper\dist\motodesktop-helper.apk（用 helper\keystore\axion-moto.jks 签名）
+#       + helper\dist\motodesktop-helper.prop（实际烘焙进 APK 的 version/versionCode）
 ```
+
+版本取自 **`helper/helper.prop`**（不是 `../module.prop`）：只有桥接代码/资源真的改了才递增它，
+这样「只改模块脚本」的版本升级不会重装桥接 APK —— 每次重装都会换 `/data/app` 路径，
+而 LSPosed 缓存的旧路径一旦失效它会**静默跳过**本模块，C-lite 就无声失效
+（`docs/C-LITE.md` §6.2）。构建脚本会把 aapt2 实际烘焙进 APK 的版本回写成
+`dist/motodesktop-helper.prop`，与 APK 不一致时会打 WARNING（`AndroidManifest.xml` 里写死
+`versionCode`/`versionName` 会盖过命令行参数，所以那两个属性已经删掉了）。
 
 流程是 `aapt2 compile/link → javac → d8 → 注入 classes.dex → zipalign → apksigner`，
 四个类一个字符串数组，不值得上 Gradle。`stubs/` 里是 LSPosed 编译期接口（不打包进 dex 之外）。
@@ -61,9 +69,9 @@ pwsh -File helper\build-helper.ps1 -SdkRoot "$env:ANDROID_SDK_ROOT" -JdkHome "$e
 
 刷入 **axion_recents** 模块时会**自动安装本 APK**：`customize.sh` 尽力执行
 `pm install -r -d "$MODPATH/extras/motodesktop-helper.apk"`（装不上也不中止刷入，下次开机重试）；
-`service.sh` 每次开机会调用 `ensure_helper_installed()`，比较 `extras/motodesktop-helper.apk`
-与已装 `pm path com.axion.motodesktop` 的 base.apk 的 sha256，不一致才重装 ——
-所以更新模块时桥接会**自动升级**到 `extras/` 里那一份。刷完后它位于设备上
+`service.sh` 每次开机会调用 `ensure_helper_installed()`，读模块根目录的 `helper.prop`
+（打包时由 `dist/motodesktop-helper.prop` 复制而来）拿到目标 `versionCode`，**只有已装版本更低
+时才**重装。刷完后它位于设备上
 `/data/adb/modules/axion_recents/extras/motodesktop-helper.apk`。
 
 你只需要：

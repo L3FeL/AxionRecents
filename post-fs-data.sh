@@ -49,7 +49,8 @@
 #   * RRO 一旦生效，recents 就指给我们的包，原厂 Moto 桌面因此失去 signature|recents
 #     的 MANAGE_ACTIVITY_TASKS（v1.2 已验证的后果），所以 boot-completed.sh /
 #     service.sh 必须在同一次开机里把 HOME 交给 com.android.launcher3，并在它起不来时
-#     自动停用模块。RRO 是否真的生效由这两个阶段用 OMS 查询判定，不看本脚本的标记。
+#     把 HOME 交还原厂桌面、只写日志（v1.2.2 起不再自动停用模块）。
+#     RRO 是否真的生效由这两个阶段用 OMS 查询判定，不看本脚本的标记。
 #
 # 停用模块 + 重启 = 完全恢复原厂（磁盘上原厂文件从未被改动）。
 # ---------------------------------------------------------------------------
@@ -79,6 +80,7 @@ log "start MODDIR=$MODDIR"
 # MANAGE_ACTIVITY_TASKS，而我们的 com.android.launcher3 包随之消失（HOME/recents 都归原厂）。
 # 想再用 Axion 堆叠后台就在管理器里重新启用 + 重启。
 # 下面只保留“上一次模块开机不健康就自动停用自己”的熔断，它仍会自动写 disable。
+# （v1.2.2：这段熔断已删除 —— 只保留“停用模块 + 重启 = 完全恢复原厂”这条人工路径。）
 # （原厂 /product/overlay/framework-rro-launcher3.apk 我们从来不动，停用即恢复原厂。）
 
 # --- 探针模式（v1.9）：撤掉 RRO、只挂 priv-app 镜像，recents/HOME 保持原厂 ---------
@@ -89,7 +91,8 @@ log "start MODDIR=$MODDIR"
 # “recents 配置改指 + HOME 换人”，还是“priv-app 镜像 / 我们的包存在”本身。
 # ⚠ 注意：正常使用中**必须**保持模块树里有那份 RRO。手动 park 掉之后
 #   如果把 HOME 留给了 com.android.launcher3，Axion 桌面会因为拿不到 signature|recents 的
-#   MANAGE_ACTIVITY_TASKS 而崩溃循环，service.sh 的看门狗会把原厂桌面抢回来并停用本模块。
+#   MANAGE_ACTIVITY_TASKS 而崩溃循环，service.sh 的看门狗会把原厂桌面抢回来（只记录日志，
+#   v1.2.2 起不再停用本模块）。
 #   诊断完请把文件改回 system/product/overlay/AxionRecentsOverlay.apk 再重启。
 PROBE=/data/adb/axion_recents_probe_no_recents
 if [ -f "$PROBE" ]; then
@@ -98,6 +101,7 @@ if [ -f "$PROBE" ]; then
 fi
 
 # --- 开机失败自动停用（v1.9 收紧：只有"上一次模块生效的开机被看门狗判定健康"才放行）
+#     ↑ 这段口径的历史说明保留在这里，**行为已在 v1.2.2 删除**（见下面那条横幅）。
 # v1.6~v1.8 的旧口径是 service.sh 一看到 sys.boot_completed 就清计数，于是
 # “启机后崩溃 → 系统自己重启 → 计数被清 → 第二次照样挂载”会无限循环。
 # v1.8 实测：SystemUI 崩溃循环把设备反复重启，两次开机都挂载了 payload。
@@ -105,44 +109,39 @@ fi
 #   * 标记存在  = 上一次模块生效的开机是健康的 ⇒ 消费掉它、计数归 1、正常挂载。
 #   * 标记不存在 且 计数 >= 2 ⇒ 上一次模块生效的开机没能健康结束 ⇒ 本次完全不挂载，
 #     退回原厂，并 touch disable 等用户处理。
-HEALTHY=/data/adb/axion_recents_healthy
-GUARD=/data/adb/axion_recents_bootcount
-prev_healthy=no
-[ -f "$HEALTHY" ] && prev_healthy=yes
-if [ "$prev_healthy" = yes ]; then
-    rm -f "$HEALTHY"
-    echo 1 > "$GUARD"
-    n=1
-else
-    n=0
-    [ -f "$GUARD" ] && n=$(cat "$GUARD" 2>/dev/null)
-    n=$((n + 1))
-    echo "$n" > "$GUARD"
-fi
-log "boot attempt $n (previous module boot healthy: $prev_healthy)"
-if [ "$n" -ge 2 ]; then
-    log "GUARD: boot attempt $n without a healthy marker - skipping all mounts and disabling the module"
-    log "  上一次模块生效的开机没有健康结束（崩溃/自行重启）。修复后先 rm -f $GUARD $MODDIR/disable 再重启"
-    touch "$MODDIR/disable"
-    exit 0
+# --- v1.2.2：自动停用 / 熔断机制已删除 -------------------------------------------------
+# v1.9~v1.2.1 这里有一段守卫：上一次模块生效的开机没留下健康标记（或存在 crashloop 标记）
+# 就"本次开机完全不挂载 + touch disable 等用户处理"。2026-10-03 真机上它误判过一次：
+# C-lite 看门狗单次 pidof 取不到原厂桌面进程（系统回收/重启的那一瞬间）就判成崩溃循环，
+# 于是写了 disable + crashloop 标记并自动重启；之后每次开机这里又写一次 disable
+# ⇒ KernelSU 永远显示"未启用"，用户点启用再重启也没用（还得连带删 _bootcount 才解得开）。
+# 现在的口径：**每次开机都照常挂载**。异常只写日志和 needs_attention 标记，绝不自己停用
+# 模块、绝不跳过挂载、绝不自动重启。要停用模块请在 KernelSU 里手动关掉（或删模块目录）再重启。
+for m in /data/adb/axion_recents_bootcount /data/adb/axion_recents_rebooted \
+         /data/adb/axion_recents_crashloop; do
+    if [ -f "$m" ]; then
+        log "note: removing stale circuit-breaker marker $m (auto-disable was removed in v1.2.2)"
+        rm -f "$m" 2>/dev/null
+    fi
+done
+if [ -f "$MODDIR/disable" ]; then
+    log "note: $MODDIR/disable exists - KernelSU keeps a module disabled while that file is there."
+    log "      re-enable axion_recents in the KernelSU manager (or delete that file) and reboot;"
+    log "      v1.2.2 never writes it by itself."
 fi
 
 # v2.0 C-lite：boot-completed.sh 会写 /data/adb/axion_recents_clite_state（pending -> ok/failed）
 # 表示“本次开机的 C-lite 切换是否已经 settle”。service.sh 靠它决定要不要等 boot-completed
-# 做完再启动健康看门狗（否则看门狗会在探测还没跑完时就判定不健康并回滚）。每开机先清掉。
+# 做完再启动健康看门狗（v1.2.2 起看门狗只记录日志，不再回滚）。每开机先清掉。
 rm -f /data/adb/axion_recents_clite_state
 
 # --- v1.7 崩溃循环熔断（上一次开机 service.sh 判定桌面崩溃循环时留下的标记）------
+#     ↑ 该熔断在 v1.2.2 已删除，这里仅保留历史说明。
 # 标记存在 ⇒ 本次开机**完全不挂载**：不新增 priv-app 目录、不启用 RRO，
 # 系统以“原厂桌面 + 原厂 recents 配置”启动。这样即使 payload 有问题，
 # 设备也只会退回原厂，而不会出现“HOME 反复崩溃 + system_server 重启”。
-CRASHLOOP=/data/adb/axion_recents_crashloop
-if [ -f "$CRASHLOOP" ]; then
-    log "CRASHLOOP marker present ($(cat "$CRASHLOOP" 2>/dev/null)) - skipping all mounts"
-    log "  修复 payload 后，删除 $CRASHLOOP 与 $MODDIR/disable 再重启即可重试"
-    touch "$MODDIR/disable"
-    exit 0
-fi
+# （v1.2.2）crashloop 熔断分支已删除：本脚本每次开机都正常挂载，见上面的说明。
+# 遗留的 /data/adb/axion_recents_crashloop 已在上面统一清掉，不再影响任何行为。
 
 # --- 等分区就绪 -----------------------------------------------------------
 i=0
