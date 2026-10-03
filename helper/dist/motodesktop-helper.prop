@@ -2,4 +2,4 @@
 # tools/build-zip.ps1 ships this as helper.prop inside the module zip; customize.sh and
 # service.sh compare the installed versionCode against it before reinstalling the bridge.
 version=1.2.2
-versionCode=5
+versionCode=6

@@ -1,14 +1,18 @@
 package com.axion.motodesktop;
 
+import android.app.Activity;
 import android.content.Context;
 import android.content.pm.PackageInfo;
 import android.content.pm.PermissionInfo;
 import android.hardware.display.DisplayManager;
 import android.os.Binder;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.Display;
 import android.view.MotionEvent;
+import android.view.View;
+import android.view.animation.PathInterpolator;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -91,6 +95,15 @@ public class Main implements IXposedHookLoadPackage {
             "enforceCallingPermission",
             "enforceCallingOrSelfPermission"};
 
+    /**
+     * Activities that can be the C-lite home. Moto's launcher is AOSP-derived, so the concrete
+     * activity is {@code com.android.launcher3.uioverrides.QuickstepLauncher} (the manifest entry
+     * {@code CustomizationPanelLauncher} is only its alias).
+     */
+    private static final String[] LAUNCHER_ACTIVITY_CLASSES = new String[] {
+            "com.android.launcher3.uioverrides.QuickstepLauncher",
+            "com.android.launcher3.Launcher"};
+
     private static final Map<String, Boolean> PERM_CACHE = new ConcurrentHashMap<String, Boolean>();
     private static final Set<String> LOGGED =
             Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
@@ -102,6 +115,8 @@ public class Main implements IXposedHookLoadPackage {
     private static volatile boolean sSystemServer;
     /** Class loader of the Moto launcher process; null inside system_server. */
     private static volatile ClassLoader sTargetClassLoader;
+    /** Uptime of the last "home arrives" animation, used to debounce activity resumes. */
+    private static volatile long sLastArriveUptime;
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -194,7 +209,7 @@ public class Main implements IXposedHookLoadPackage {
      *       intercepted.</li>
      * </ul>
      *
-     * <p>All four hooks below only act when the proxy really is missing, so a launcher that does own
+     * <p>All five hooks below only act when the proxy really is missing, so a launcher that does own
      * the recents role keeps its stock behaviour.
      */
     private static void installCliteGestureHooks(ClassLoader cl) {
@@ -209,6 +224,14 @@ public class Main implements IXposedHookLoadPackage {
                 new StatusBarTouchHook());
         // 4) Safety net for the sleep action itself.
         hookMethod(cl, "com.android.quickstep.SystemUiProxy", "lockDevice", new LockDeviceHook());
+        // 5) C-lite gets no remote transition for the home task (the stock launcher has no
+        //    SystemUiProxy, so nothing registers one): the platform plays its own OPEN transition
+        //    there, the closing app window slides off the bottom and the home lands with a hard
+        //    cut (measured: one frame, 59.5 mean frame difference). Animate the launcher's own
+        //    decor view instead - it is the only surface we can reach from this process.
+        for (String cls : LAUNCHER_ACTIVITY_CLASSES) {
+            hookMethod(cl, cls, "onResume", new HomeArriveHook());
+        }
         XposedBridge.log("AxionDesktopBridge clite gestures installed in launcher hooks=" + sHookCount
                 + " boot=" + readBootId());
     }
@@ -700,6 +723,115 @@ public class Main implements IXposedHookLoadPackage {
                 Log.i(TAG, "status bar touch hook failed: " + t);
             }
         }
+    }
+
+    /**
+     * "Desktop drops in from the top" animation for C-lite's app -> home transition.
+     *
+     * <p>Why the stock launcher needs help: C-lite points {@code config_recentsComponentName} at
+     * Axion, so SystemUI never binds the stock launcher's {@code TouchInteractionService} and
+     * {@code mSystemUiProxy} stays null there. Without the proxy
+     * {@code registerRemoteTransition()} is a no-op, so the platform cannot be handed a
+     * launcher-driven transition for the home task and plays its own OPEN transition: the closing
+     * app window slides down off the screen while the home appears at its final position (measured
+     * on device as a single 59.5 mean-frame-difference cut). That window belongs to the Shell, but
+     * the launcher's own decor view is ours - so the desktop is pushed up, shrunk and faded at
+     * {@code onResume} and animated into place while the app is still leaving.
+     *
+     * <p>Knobs live in {@code Settings.Global} (defaults in brackets) and can be changed on a
+     * running device with {@code settings put global <key> <value>}; {@code 0} for
+     * {@code axion_home_arrive_enabled} turns the animation off:
+     * <ul>
+     *   <li>{@code axion_home_arrive_enabled} [1]</li>
+     *   <li>{@code axion_home_arrive_scale} [1.35] - start scale, 1.0 = no scaling. It is raised to
+     *       {@code 1 + 2 * |translation|} when needed: the launcher window carries the wallpaper, so
+     *       a start scale that does not cover the shifted content would show the window background
+     *       (a black band) along the opposite edge.</li>
+     *   <li>{@code axion_home_arrive_translation} [-0.16] - start offset as a fraction of the
+     *       window height, negative = above its final position</li>
+     *   <li>{@code axion_home_arrive_alpha} [1.0] - start alpha</li>
+     *   <li>{@code axion_home_arrive_duration} [220] - milliseconds; keep it at or below the
+     *       platform's own home transition (~250 ms) so the transform is already back to identity
+     *       when the transition finishes and the live window replaces the shell leash</li>
+     * </ul>
+     */
+    private static final class HomeArriveHook extends XC_MethodHook {
+
+        private static final String ENABLED = "axion_home_arrive_enabled";
+        private static final String SCALE = "axion_home_arrive_scale";
+        private static final String TRANSLATION = "axion_home_arrive_translation";
+        private static final String ALPHA = "axion_home_arrive_alpha";
+        private static final String DURATION = "axion_home_arrive_duration";
+
+        /** onResume also fires for configuration changes and quick home/app toggles. */
+        private static final long DEBOUNCE_MS = 350;
+
+        @Override
+        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+            try {
+                if (!(param.thisObject instanceof Activity)) {
+                    return;
+                }
+                final Activity activity = (Activity) param.thisObject;
+                final View root = activity.getWindow() == null
+                        ? null : activity.getWindow().getDecorView();
+                if (root == null || root.getWidth() <= 0 || root.getHeight() <= 0) {
+                    return;
+                }
+                final long now = SystemClock.uptimeMillis();
+                if (now - sLastArriveUptime < DEBOUNCE_MS) {
+                    return;
+                }
+                final Context cr = activity.getApplicationContext();
+                if (Settings.Global.getInt(cr.getContentResolver(), ENABLED, 1) == 0) {
+                    return;
+                }
+                final float requestedScale = clamp(Settings.Global.getFloat(
+                        cr.getContentResolver(), SCALE, 1.35f), 0.2f, 3f);
+                final float translation = clamp(Settings.Global.getFloat(
+                        cr.getContentResolver(), TRANSLATION, -0.16f), -1.5f, 1.5f);
+                final float alpha = clamp(Settings.Global.getFloat(
+                        cr.getContentResolver(), ALPHA, 1f), 0f, 1f);
+                final int duration = (int) clamp(Settings.Global.getFloat(
+                        cr.getContentResolver(), DURATION, 220f), 60f, 1500f);
+                // The launcher window carries the wallpaper, so any part of it that the shifted
+                // content does not cover shows the window background (black). Translating up by T
+                // uncovers T of the height at the bottom edge, scaling by S covers (S - 1) / 2 at
+                // each edge, so require S >= 1 + 2T.
+                final float minScale = 1f + Math.max(0f, -translation) * 2f;
+                final float scale = Math.max(requestedScale, minScale);
+                if (scale > requestedScale + 0.001f) {
+                    Log.i(TAG, "home arrive: start scale raised " + requestedScale + " -> " + scale
+                            + " so the shifted window stays covered");
+                }
+                sLastArriveUptime = now;
+                final float startY = root.getHeight() * translation;
+                root.animate().cancel();
+                root.setPivotX(root.getWidth() / 2f);
+                root.setPivotY(root.getHeight() / 2f);
+                root.setScaleX(scale);
+                root.setScaleY(scale);
+                root.setTranslationY(startY);
+                root.setAlpha(alpha);
+                root.animate()
+                        .scaleX(1f)
+                        .scaleY(1f)
+                        .translationY(0f)
+                        .alpha(1f)
+                        .setDuration(duration)
+                        .setInterpolator(new PathInterpolator(0.16f, 0f, 0.24f, 1f))
+                        .start();
+                Log.i(TAG, "home arrive: " + activity.getClass().getName()
+                        + " scale " + scale + "->1 translationY " + startY + "->0 alpha "
+                        + alpha + "->1 in " + duration + "ms");
+            } catch (Throwable t) {
+                Log.i(TAG, "home arrive failed: " + t);
+            }
+        }
+    }
+
+    private static float clamp(float value, float min, float max) {
+        return value < min ? min : (value > max ? max : value);
     }
 
     /**

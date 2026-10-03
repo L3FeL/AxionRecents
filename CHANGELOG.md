@@ -75,6 +75,18 @@ v1.2.1 的 bug 修复版：删掉模块的自我保护机制（并自动清理�
   后续处理：不启动交互式 recents 动画、不把位移喂给手势 handler，手指停在哪都不影响结果（实测
   400 px 的短上滑也直接完整进入最近任务）。斜向/水平 swipe（夹角 ≤ 15°）、触控板手势，以及默认
   模式（home == overview）行为全部不变；从**应用**上滑的跟手动画回归验证无变化。详见 §11。
+* **桥接（LSPosed 桥接 APK，versionCode 6）**：C-lite 下「应用 → 原厂桌面」不再只有平台的
+  「应用窗口向下滑出」一种动作 —— 原厂桌面自己的窗口会**从上方缩放落下**。桥接 hook
+  `QuickstepLauncher` / `Launcher` 的 `onResume`（`HomeArriveHook`），去抖 400 ms 后把
+  décorView 的 pivot 设到屏幕中心、先摆到起始状态（缩放 / 上移 / 透明度）再用
+  `PathInterpolator(0.16, 0, 0.24, 1)` 动回收敛。默认 `axion_home_arrive_scale=1.35`、
+  `axion_home_arrive_translation=-0.16`（= 起始上移屏高的 16%）、`axion_home_arrive_alpha=1.0`、
+  `axion_home_arrive_duration=220` ms；`axion_home_arrive_enabled=0` 可整体关掉（五个键都是
+  `Settings.Global`，改完立即生效）。起始缩放会被钳制在 `1 + 2×|translation|` 之上，否则
+  桌面窗口缩放后露出的部分会是**黑边**（实测 `scale=0.82` 有明显黑带，`1.35` 正常）。
+  注意这次**不接管**关闭应用窗口自身的动画：C-lite 下它是平台默认 OPEN 转场
+  （`remoteTransition = null`），leash 在 WM Shell 手里、桥接作用域改不到；转场收尾那一帧
+  约 59 的硬跳变改动前后一致，属平台 leash→活窗口切换。详见 `docs/C-LITE.md` §12。
 * **版本**：`module.prop` 的 `version=v1.2.2`、`versionCode=5`，发布 zip 为
   `dist/AxionRecents-v1.2.2.zip`。
 

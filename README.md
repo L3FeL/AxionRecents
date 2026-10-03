@@ -2,22 +2,6 @@
 
 把 AxionOS 派生 Launcher3 的**牌堆式最近任务**带到 Motorola Android 16（SDK 36）
 
-![堆叠式后台](docs/screenshot.png)
-
-模块 ID `axion_recents` · 当前版本 **v1.2.2** · 作者 **L3FeL** · 许可 **GPL-3.0**
-
-## 实现方式
-
-1. 开机最早阶段 `post-fs-data.sh` 把 `payload/AxionLauncher3.apk` 与 privapp 权限白名单 **tmpfs 镜像**
-   进 `/system_ext/priv-app/AxionLauncher3/`、`/system_ext/etc/permissions/` 。
-2. 静态框架 RRO（`priority 100`）把 `android:string/config_recentsComponentName` 指到
-   `com.android.launcher3/com.android.quickstep.RecentsActivity`。
-3. `service.sh` / `boot-completed.sh` 确认 RRO 生效后把 HOME 角色交给 Axion 桌面，并持续自检
-   （观察桌面/SystemUI 是否崩溃循环）。
-4. C-lite 靠模块自带的 LSPosed 桥接（`extras/motodesktop-helper.apk`）：替仍当 HOME 的原厂桌面放行
-   AOSP 只授予 recents 组件的 `recents` 标志权限，并补上 C-lite 下失效的两个桌面手势。
-
-
 ## 功能
 
 * 在 Motorola 上实现堆叠式最近任务。

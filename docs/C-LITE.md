@@ -546,3 +546,61 @@ finishTouchTracking: mPassedWindowMoveSlop=false, mInteractionHandler=null, mAct
 **回归**：从**应用**上滑（先用 `mCurrentFocus` 确认 App 真的在前台）仍是
 `startTouchTrackingForWindowAnimation` + 逐帧跟手动画，没有 `axion:` 行；原厂桌面上横向 swipe
 （`passedSlop` 后走原分支）同样保持原行为。
+
+## 12. 应用 → 原厂桌面的到达动画：桌面从上方缩放落下（桥接 versionCode 6 起）
+
+**问题**：C-lite 下从应用返回原厂桌面时，关闭的应用窗口由平台做「整窗向下滑出」，桌面只是静默
+出现在下面，观感很平。需求（用户原话）是「能不能让应用窗口移出屏幕的同时，桌面从上面缩放移
+下来」。
+
+**为什么只能动桌面**：C-lite 下原厂桌面进程里的 `SystemUiProxy` 是 null（手势宿主是被 SystemUI
+绑定的 Axion `TouchInteractionService`），所以这次 app→home 走的是 **WM Shell 的默认 OPEN 转场**
+（`Transition requested (#N): type = OPEN`，`remoteTransition = null`）：关闭应用的 leash 在 Shell
+手里，桥接（作用域只有 `android` + `com.motorola.launcher3`）够不着它。能改的只有**桌面自己的
+窗口** —— 它在桥接进程里。所以做法是「平台继续滑它的应用窗口，我们让桌面同时从上方落下」。
+
+**做法**（`helper/java/com/axion/motodesktop/Main.java`，`installCliteGestureHooks()` 里的第 5 组
+hook）：对 `com.android.launcher3.uioverrides.QuickstepLauncher` 与 `com.android.launcher3.Launcher`
+hook `onResume`，`afterHookedMethod` 里取 `activity.getWindow().getDecorView()`：
+
+1. 去抖：距上次触发不足 `400 ms` 直接跳过（避免一次返回被多个 Activity 的 resume 重复播）；
+2. pivot 设到屏幕中心（`setPivotX/Y`），再写起始状态 `scale` / `translationY = h × translation` /
+   `alpha`；
+3. `view.animate()` 用 `PathInterpolator(0.16f, 0f, 0.24f, 1f)` 在 `duration` 内回到 `scale=1`、
+   `translationY=0`、`alpha=1`。
+
+日志：`AXMOTO : home arrive: <class> scale X->1 translationY Y->0 alpha A->1 in Nms`。
+
+**设置键**（都是 `Settings.Global`，改完立即生效、不用重装）：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `axion_home_arrive_enabled` | `1` | 总开关，`0` 关掉这套动画 |
+| `axion_home_arrive_scale` | `1.35` | 起始缩放（> 1 = 桌面偏大，配合上移才有「落下」感） |
+| `axion_home_arrive_translation` | `-0.16` | 起始上移量占屏幕高度的比例（负 = 在上方） |
+| `axion_home_arrive_alpha` | `1.0` | 起始透明度 |
+| `axion_home_arrive_duration` | `220` | 时长（ms） |
+
+**坑 1：起始缩放必须够大，否则露黑边。** 桌面壁纸画在这个窗口里，窗口被缩小或上移后，没被壁纸
+内容盖住的边缘露出的其实是**窗口背景（黑）**。实测 `scale=0.82`（配合 `translation=-0.16`）顶部
+有明显黑带；`scale=1.15` 仍在上边缘露一点黑；`scale=1.35` 正常。所以代码里加了钳制
+`minScale = 1 + 2 × max(0, -translation)`：读到的值更小时抬高并打日志
+`home arrive: start scale raised X -> Y`。`setLayerType(LAYER_TYPE_HARDWARE, null)` 对黑边没有帮助，
+已去掉。
+
+**坑 2：转场收尾那一帧的硬跳变是平台本来就有的，不是动画造成的。** 逐帧差分
+（`tblend=all_mode=difference` + `signalstats.YAVG`）显示：改动前的 app→home 转场收尾同样有一次
+≈ 59.5 的单帧跳变，加动画后仍是 ≈ 59–74（平台 leash → 活窗口切换）。动画本身的差分曲线是
+「平滑上升后单调衰减」，没有额外跳变。
+
+**真机验证**（`ZY22LHV5JX`，`screenrecord --time-limit 5 --bit-rate 24000000`）：
+
+```
+AXMOTO : home arrive: com.android.launcher3.uioverrides.QuickstepLauncher \
+         scale 1.35->1 translationY -433.92->0 alpha 1.0->1 in 220ms
+```
+
+抽帧（t = 0 / 0.10 / 0.20 / 0.33 s）能看到桌面整层从上方落下并放大到位，四边没有黑边。
+
+**关闭**：`settings put global axion_home_arrive_enabled 0`；等价做法是把 `axion_home_arrive_scale`
+设为 `1`、`axion_home_arrive_translation` 设为 `0`（此时动画退化为不改变任何视觉状态）。
