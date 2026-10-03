@@ -19,3 +19,4 @@ rro/*.aligned
 .idea/
 .DS_Store
 Thumbs.db
+helper/lspd-fix/build/

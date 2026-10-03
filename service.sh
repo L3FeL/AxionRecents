@@ -429,28 +429,64 @@ HELPER_SRC="$MODDIR/extras/motodesktop-helper.apk"
 HELPER_PKG=com.axion.motodesktop
 HELPER_PROP="$MODDIR/helper.prop"
 LSPD_DB=/data/adb/lspd/config/modules_config.db
+# v1.2.2.x: the module repairs the cached path itself. lspd-fix.jar is a dex that app_process runs;
+# it rewrites modules_config.db through the framework's SQLiteDatabase (WAL aware, and it takes the
+# same locks lspd takes), which is why the device still needs no sqlite3 binary.
+LSPD_FIX_JAR="$MODDIR/helper/lspd-fix.jar"
 
 helper_want_version() { sed -n 's/^versionCode=//p' "$HELPER_PROP" 2>/dev/null | head -n 1; }
 helper_have_version() { pm dump "$HELPER_PKG" 2>/dev/null | sed -n 's/.*versionCode=\([0-9][0-9]*\).*/\1/p' | head -n 1; }
 helper_installed_path() { pm path "$HELPER_PKG" 2>/dev/null | head -1 | sed 's/^package://'; }
 
+# Prints the apk_path LSPosed has on record for the bridge. The app_process tool reads the committed
+# row; the raw grep fallback also finds copies of older paths left in freed pages, so it is only used
+# when the tool cannot run at all.
+lsposed_cached_path() {
+    if [ -f "$LSPD_FIX_JAR" ]; then
+        out=$(CLASSPATH="$LSPD_FIX_JAR" app_process /system/bin com.axion.recents.LspdPathFix -get "$LSPD_DB" "$HELPER_PKG" 2>/dev/null)
+        rc=$?
+        case "$out" in
+            ''|usage:*) log "  lspd cache: read via app_process failed (rc=$rc) - falling back to a raw scan" ;;
+            *) echo "$out"; return 0 ;;
+        esac
+    fi
+    grep -a -o '/data/app/[^/]*/com\.axion\.motodesktop-[^/]*/base\.apk' "$LSPD_DB" 2>/dev/null | sort -u
+}
+
+# Rewrites the cached path. Returns 0 only when the database names the installed path afterwards.
+repair_lsposed_path() {
+    [ -f "$LSPD_FIX_JAR" ] || { log "    repair : $LSPD_FIX_JAR missing in the module"; return 1; }
+    out=$(CLASSPATH="$LSPD_FIX_JAR" app_process /system/bin com.axion.recents.LspdPathFix "$LSPD_DB" "$HELPER_PKG" "$1" 2>&1)
+    rc=$?
+    log "    repair : rc=$rc $(echo "$out" | tr '\n' ' ')"
+    [ "$rc" -eq 0 ] || return 1
+    now=$(lsposed_cached_path)
+    for p in $now; do [ "$p" = "$1" ] && return 0; done
+    return 1
+}
+
 # LSPosed caches the path of the bridge APK. After a re-install the cached path is gone and LSPosed
-# silently skips the module - no error anywhere, C-lite just stops working. The device has no
-# sqlite3, so the module cannot repair modules_config.db itself: it can only shout about it.
+# silently skips the module - no error anywhere, C-lite just stops working. v1.2.2 could only shout
+# about it; the module now fixes modules_config.db itself and only shouts when that fails.
 check_lsposed_path() {
     [ -f "$LSPD_DB" ] || return 0
-    cached=$(grep -a -o '/data/app/[^/]*/com\.axion\.motodesktop-[^/]*/base\.apk' "$LSPD_DB" 2>/dev/null | sort -u)
-    [ -n "$cached" ] || return 0
     actual=$(helper_installed_path)
     [ -n "$actual" ] || return 0
+    cached=$(lsposed_cached_path)
+    [ -n "$cached" ] || return 0
     stale=""
     for p in $cached; do
         [ "$p" = "$actual" ] || stale="${stale}${p} "
     done
     [ -z "$stale" ] && return 0
-    log "  WARNING: LSPosed cached a stale bridge path and will keep skipping the module:"
+    log "  LSPosed cached a stale bridge path so it would keep skipping the module:"
     for p in $stale; do log "    cached : $p"; done
     log "    actual : $actual"
+    if repair_lsposed_path "$actual"; then
+        log "    fixed  : the cached path now matches the installed bridge"
+        log "    note   : LSPosed hands the module to newly started apps; if C-lite is still off, reboot once"
+        return 0
+    fi
     log "    fix    : open LSPosed, switch '$HELPER_PKG' off and on, then reboot"
     date > /data/adb/axion_recents_needs_attention 2>/dev/null
     return 0

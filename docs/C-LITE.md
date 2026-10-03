@@ -269,7 +269,8 @@ adb reboot
 `/data/adb/lspd/config/modules_config.db` 里。每次 `pm install` 都会给 APK 换一个
 `/data/app/~~<随机字符串>/com.axion.motodesktop-<随机字符串>/base.apk` 路径，旧目录随即被删。
 路径一旦不存在，LSPosed 就**静默跳过**这个模块 —— 不报错、不提示，C-lite 直接失效。
-（打开 LSPosed 管理器看一眼并不会刷新这条记录；设备上也没有 `sqlite3` 供模块脚本改写它。）
+（打开 LSPosed 管理器看一眼并不会刷新这条记录；设备上没有 `sqlite3` 二进制，所以模块改用自带的
+`helper/lspd-fix.jar`，通过 `app_process` + 框架 `SQLiteDatabase` 改写它，见 §10。）
 
 **修法**（30 秒）：打开 LSPosed 管理器 → 找到 `Axion Desktop Bridge`（`com.axion.motodesktop`）
 → 把开关**关掉再打开** → 重启。管理器这次会把新路径写回它的库，握手就恢复了。
@@ -279,9 +280,10 @@ adb reboot
 * 桥接 APK 有独立版本号（模块根目录的 `helper.prop`，由 `helper/build-helper.ps1` 从实际
   产物生成）。`customize.sh` 与 `service.sh` 只在「已装版本 < zip 里的版本」时才重装，
   所以**只改脚本/文档的版本升级不会碰桥接 APK，路径不动，C-lite 不受影响**；
-* 真的重装了桥接时，模块会比对 LSPosed 缓存路径与 `pm path` 的实际路径，不一致就打
+* 真的重装了桥接时，模块会比对 LSPosed 缓存路径与 `pm path` 的实际路径，不一致就**自己修**
+  （`helper/lspd-fix.jar` 把真实路径写回并复核，见 §10）；只有修不了才打
   `WARNING: LSPosed cached a stale bridge path ...` 并写
-  `/data/adb/axion_recents_needs_attention`，按上面那 30 秒步骤操作即可；
+  `/data/adb/axion_recents_needs_attention`，那时再按上面那 30 秒步骤操作即可；
 * 只有 `Main.java` / 桥接资源真的变了（`helper.prop` 递增）才会发生一次重装。
 
 ## 7. 桌面不出现在最近任务里（build-77 起）
@@ -411,3 +413,136 @@ adb shell input tap 450 1750; adb shell input tap 450 1750   # 两次连点（23
 
 更新方式：换新 zip 刷入模块（里面的桥接 APK 只有在**版本比已装的更高**时才会自动覆盖安装，
 见 §5），然后重启。只改模块脚本、没动桥接的版本升级**不会**碰桥接 APK，C-lite 不受影响。
+
+## 9. 最近任务 → 桌面的转场动画（build-85 起）
+
+C-lite 下「回到桌面」时，**桌面本身不是我们能动的窗口**：HOME 属于 `com.motorola.launcher3`，
+平台把它当作 background app 留在最近任务窗口后面
+（`FallbackActivityInterface.java:53-60` 的 `super(false, DEFAULT, BACKGROUND_APP)`），进入最近任务
+时把它放大、返回时再自己收回正常大小。Axion 侧拿到的那条 home transition leash
+（`RemoteAnimationTarget.leash`）**不是屏幕上真正显示的 surface**：真机上我们确实每帧都写进去了
+（`RecentsActivity: home reveal: animating 1 leash(es) from scale=0.05 …`），但
+`dumpsys SurfaceFlinger --list` 里那条 leash 连 handle 都没有，录屏逐帧对比也证明屏幕毫无变化。
+所以「对 home leash 做 matrix/alpha」这条路在 C-lite 下无效（日志 + SF 层清单 + 录屏三重否证）。
+
+现在的做法是动画**我们自己的** overview —— `RecentsActivity` 的 `mDragLayer`（卡片、操作行、遮罩）：
+在转场时长内把它缩放到 `axion_home_reveal_zoom` 并淡出到 `axion_home_reveal_alpha`，桌面则被系统
+自己收回，两者叠起来就是「卡片冲出来（或退开），桌面浮现」。
+
+设置（`settings put global …`，改完立即生效，不用重启也不用重装）：
+
+| 键 | 默认 | 含义 |
+| --- | --- | --- |
+| `axion_home_reveal_enabled` | 1 | 0 = 完全关掉本模块的转场动画 |
+| `axion_home_reveal_zoom` | 1.4 | >1 卡片朝观察者冲出来（现有观感）；<1 卡片收小退开；1 = 只淡出 |
+| `axion_home_reveal_alpha` | 0 | 转场结束时 overview 的不透明度（0 = 完全淡出） |
+| `axion_home_reveal_duration` | 250 | 转场时长（ms）。250 与原生等长，改大会让整段转场变慢 |
+| `axion_home_reveal_scale` | 0.85 | 旧参数（写给 home leash 的缩放），C-lite 下无可见效果，仅留作调试 |
+
+```bash
+adb shell settings put global axion_home_reveal_zoom 1.4   # 想更猛就 1.6，想温和就 1.15
+adb shell settings put global axion_home_reveal_duration 250
+adb shell settings put global axion_home_reveal_enabled 0  # 关掉
+```
+
+触发路径：最近任务里**按返回键**、或**清空全部任务**时（`fallback/RecentsState.kt:122-135` 的
+`onBackInvoked`：`runningTaskView == null || isBeingDismissed` → `recentsView.startHome()`）。
+**按 HOME 键从最近任务回桌面不走这条路径**（system_server 直接拉起原厂桌面，不经过
+`RecentsActivity.startHome`），那种情况下看到的完全是系统自带的动画，模块无法干预。
+
+实现细节（build-86 修）：转场结束时**不能**立刻把 `mDragLayer` 的 scale/alpha 复位 —— 那个回调
+跑在最近任务窗口还留在屏幕上的时候，复位会让整个 overview 闪回一帧（真机 30fps 逐帧量到：动画
+结束后 YAVG 从 106 突跳到 113 再落回，肉眼即「回闪一下」）。复位改到 `RecentsActivity.onStart()`
+（窗口仍隐藏时执行，下次进最近任务自然是干净状态）。修复后同一段录屏结尾帧差 ≈ 0，不再闪回。
+
+实现细节（build-87）：动画拆成两条曲线 —— scale 仍用
+`AxAnimationEngine.HOME_GESTURE_WORKSPACE_INTERPOLATOR`，alpha 用
+`PathInterpolator(0.55f, 0f, 1f, 1f)`（后置淡出，先让内容冲出来）；动画期间给 `mDragLayer` 开
+`LAYER_TYPE_HARDWARE`，结束/取消时清回 `LAYER_TYPE_NONE`；动画未结束前 `dispatchTouchEvent`
+直接吞掉新的 `ACTION_DOWN`，避免在移动的画面上误触卡片。真机 30 fps 逐帧：帧差
+17.8→24.5→25.2→32.1→30.0→28.5→23.1→13.9→1.85→0，YAVG 189→194→…→106 单调衰减；
+`dumpsys gfxinfo com.android.launcher3` 报 `Total frames rendered: 84 / Janky frames: 0 (0.00%)`、
+99th percentile 16 ms、`Number Missed Vsync: 0`。
+
+## 10. LSPosed 缓存路径自愈（v1.2.2 起）
+
+**问题**：LSPosed 把桥接 APK 的加载路径记在 `/data/adb/lspd/config/modules_config.db`
+（表 `modules`，列 `module_pkg_name` / `apk_path`）里。`pm install` 会换一个
+`/data/app/~~<随机>/com.axion.motodesktop-<随机>/base.apk` 路径，旧路径一被删，LSPosed 就静默
+跳过该模块（现象见 §6.2）。设备上没有 `sqlite3` 二进制，模块脚本原本只能报警告。
+
+**做法**：模块自带 `helper/lspd-fix.jar`（源 `helper/lspd-fix/com/axion/recents/LspdPathFix.java`，
+由 `tools/build-lspd-fix.ps1` 用 javac → jar → d8 打成只含 `classes.dex` 的包），用
+`app_process` 借系统 framework 的 `android.database.sqlite.SQLiteDatabase` 直接读写这个库
+（WAL 由 SQLite 自身处理，不需要 `wal_checkpoint`）。用法：
+
+```bash
+# 读缓存路径（比 grep 可靠：grep 可能命中已释放页里的旧路径副本）
+CLASSPATH=/data/adb/modules/axion_recents/helper/lspd-fix.jar \
+  app_process /system/bin com.axion.recents.LspdPathFix -get <db> com.axion.motodesktop
+
+# 写真实路径并复核（打开库带 10×200 ms 重试）
+CLASSPATH=... app_process /system/bin com.axion.recents.LspdPathFix <db> com.axion.motodesktop <实际路径>
+```
+
+`service.sh`（`:431` 起）的接法：`lsposed_cached_path()` 先调 `-get`，输出为空/失败才回落到
+`grep -a -o '/data/app/[^/]*/com\.axion\.motodesktop-[^/]*/base\.apk' "$LSPD_DB"`；
+`check_lsposed_path()` 发现缓存 ≠ `pm path` 的**实际路径**时调 `repair_lsposed_path()` 写好并复核，
+成功只记 `fixed : the cached path now matches the installed bridge`，失败才打 WARNING + 写
+`/data/adb/axion_recents_needs_attention`。
+
+**真机验证**（用 `/data/local/tmp` 里的 DB 副本，跑的是 `service.sh :361-424` 原样抽出的函数）：
+
+```
+[test]   LSPosed cached a stale bridge path so it would keep skipping the module:
+[test]     cached : /data/app/~~STALE==/com.axion.motodesktop-STALE==/base.apk
+[test]     actual : /data/app/~~nIq-nzmKU4fGSIyoqnSwqA==/com.axion.motodesktop-lBFT63ZK-X_7OtFp5eVWWg==/base.apk
+[test]     repair : rc=0 fixed: com.axion.motodesktop /data/app/~~STALE==/… -> /data/app/~~nIq-…==/…
+[test]     fixed  : the cached path now matches the installed bridge
+```
+
+DB 正常时再跑一次只留标题行（静默），也不写 `needs_attention`。注意：实测这个 LSPosed 版本在
+`pm install -r` 之后**自己也会更新**这条记录，所以该失败模式不一定还能自然复现 —— 自愈是兜底。
+
+**时序限制**：`service.sh` 的桥接检查排在被动看门狗（约 3–5 个 20 s 采样）之后，而 LSPosed 读库
+发生在开机更早的时候，所以修好的路径通常要**下一次开机**才对桥接生效。
+
+## 11. 从原厂桌面直接上滑进最近任务（build-88 起）
+
+**问题**：C-lite 下 HOME 角色由原厂 `com.motorola.launcher3` 持有，最近任务容器是我们自己的
+`RecentsActivity`。从原厂桌面上滑时，手势走 `InputConsumerUtils.newBaseConsumer()` 最后一个
+`else` → `OtherActivityInputConsumer`：平台会启动一段**交互式** recents 动画，按手指位移拖动
+**原厂桌面的窗口**，手指停在哪动画就停在哪（实测 400 px 短上滑只拉开一点又弹回），观感与我们自己
+桌面进最近任务完全不同。
+
+**做法**：只在「`runningTask.isHomeTask` 且 `overviewComponentObserver.isHomeAndOverviewSame()`
+为 false」（即 HOME 与最近任务不是同一个 App，只有 C-lite 成立）时，`OtherActivityInputConsumer`
+在首次越过 slop 的那次 `ACTION_MOVE` 里直接调
+`mOverviewCommandHelper.addCommand(OverviewCommandHelper.CommandType.TOGGLE, displayId)`
+（= 最近任务键 / `KEYCODE_APP_SWITCH` 的那条路），然后 `break` 掉本帧后续处理 ⇒ 不启动交互式动画、
+不把位移喂给 handler，手指位置彻底失效。斜向/水平 swipe（`swipeWithinQuickSwitchRange`，与水平面
+夹角 ≤ `OVERVIEW_MIN_DEGREES` = 15°）与触控板手势保持原行为。
+
+改动位置：`inputconsumers/OtherActivityInputConsumer.java`（新增 `mDirectToOverview` /
+`mOverviewCommandHelper` / `mDirectOverviewHandled` 字段与 `handleDirectOverview()`）、
+`InputConsumerUtils.kt`（`newBaseConsumer()` 与 `createOtherActivityInputConsumer()` 透传
+`overviewCommandHelper`）。默认模式（home == overview）走不到这个分支，行为不变。
+
+**真机验证**（build-88，logcat 全在 `com.android.launcher3` 进程内）：
+
+```
+OtherActivityInputConsumer: ACTION_DOWN: mIsDeferredDownTarget=true
+OtherActivityInputConsumer: axion: home task owned by another launcher, entering overview
+                            directly (finger position ignored)
+OverviewCommandHelper: command added: CommandInfo(type=TOGGLE …)
+OverviewCommandHelper: switching via recents animation … with end target: RECENTS
+OverviewCommandHelper: command executed successfully
+finishTouchTracking: mPassedWindowMoveSlop=false, mInteractionHandler=null, mActiveCallbacks=null
+```
+
+全程没有 `startTouchTrackingForWindowAnimation`、没有逐帧 `updateDisplacement` ⇒ 手指确实不参与；
+400 px 短上滑也直接**完整**进入最近任务（截图确认卡片、锁定/分屏/截屏、全部清除都在）。
+
+**回归**：从**应用**上滑（先用 `mCurrentFocus` 确认 App 真的在前台）仍是
+`startTouchTrackingForWindowAnimation` + 逐帧跟手动画，没有 `axion:` 行；原厂桌面上横向 swipe
+（`passedSlop` 后走原分支）同样保持原行为。

@@ -2,8 +2,9 @@
 
 ## v1.2.2 — 删除「自动停用/熔断/自动回滚」机制（真机误判修复）
 
-v1.2.1 的 bug 修复版：功能与 v1.2.1 完全一致，只删掉模块的自我保护机制，并把误判留下的
-`disable` 标记自动清理掉。
+v1.2.1 的 bug 修复版：删掉模块的自我保护机制（并自动清理误判留下的 `disable` 标记），
+另外给 payload 补上 C-lite 的「最近任务 → 桌面」缩放淡出动画，并让模块能自己修好 LSPosed
+缓存路径（不再是只报警告）。
 
 * **事故**：2026-10-03 开机后模块正常挂载并进入 C-lite（11:19:18 探测 `moto pid=13057
   focused=1 crashes=0 patch_loaded=2`，健康标记已写）。11:20:57 C-lite 看门狗的一次采样里
@@ -48,9 +49,32 @@ v1.2.1 的 bug 修复版：功能与 v1.2.1 完全一致，只删掉模块的自
   开机走默认模式（HOME 回到 Axion），C-lite 无声失效。本次真机就是这么坏的。
   现在 `customize.sh` 与 `service.sh` 都只比较 `helper.prop` 的 `versionCode`：已装版本 ≥ zip 里
   的版本就**原样不动**已装的 APK；只有真的需要重装时，才额外比对 LSPosed 缓存路径与
-  `pm path` 的实际路径，不一致就打印醒目 WARNING 并写 `needs_attention` 标记（设备上没有
-  `sqlite3`，模块改不了 LSPosed 的库），提示用户打开 LSPosed 把 `Axion Desktop Bridge`
+  `pm path` 的实际路径，不一致时**模块自己把它修回去**（见下条），只有修不了才打印醒目
+  WARNING 并写 `needs_attention` 标记，提示用户打开 LSPosed 把 `Axion Desktop Bridge`
   关掉再打开、然后重启。详见 `docs/C-LITE.md` §6.2。
+* **模块能自己修 LSPosed 缓存路径了（不再只是报警告）**：新增 `helper/lspd-fix.jar`
+  （`LspdPathFix`：`app_process` + 框架 `SQLiteDatabase`，`-get <db> <pkg>` 读、
+  `<db> <pkg> <apk>` 写并复核，写操作带 10×200 ms 打开重试；**不需要设备上有 `sqlite3`**）。
+  `service.sh` 的 `lsposed_cached_path()` 先问它、失败才回落到原来的 `grep -a` 读法；
+  `check_lsposed_path()` 检测到陈旧 → `repair_lsposed_path()` 写入真实路径 → 再读复核，
+  成功记 `fixed : the cached path now matches the installed bridge`，失败才写 `needs_attention`。
+  真机验证：对 `/data/local/tmp` 里的 DB 副本注入假路径后跑真实函数链，输出
+  `cached : /data/app/~~STALE==/…` → `repair : rc=0 fixed: … -> …` → `fixed : …`，副本里的行
+  随之变成真实路径；DB 正常时再一次运行只留下标题行（静默）。详见 `docs/C-LITE.md` §10。
+* **payload（桌面 APK）**：C-lite 的「最近任务 → 桌面」转场新增内容缩放淡出动画 —— 动画
+  `RecentsDragLayer`（`scale 1.0 → axion_home_reveal_zoom`，默认 **1.4**；`alpha 1.0 → 0`，
+  `axion_home_reveal_alpha` 默认 0；`axion_home_reveal_duration` 默认 **250 ms**，即平台
+  本身的转场时长），scale 用桌面手势曲线、alpha 用后置曲线（0.55,0,1,1），动画期间给该层开
+  硬件层并在结束时清掉，且动画未结束前吞掉新的按下事件。修掉了旧版「动画结束后整层回闪一帧」
+  的问题（复位不能放在转场结束回调里，改到 `onStart()`）。`axion_home_reveal_enabled=0`
+  可整体关掉。详见 `docs/C-LITE.md` §9；三个设置键改完立即生效，不需要重装。
+* **payload（桌面 APK，build-88）**：C-lite 下「从原厂桌面上滑进最近任务」不再跟手 —— 手势处理器
+  `OtherActivityInputConsumer` 在首次越过 slop 时，如果 running task 是**别的桌面 App 的 HOME
+  任务**（`runningTask.isHomeTask && !isHomeAndOverviewSame()`，只在 C-lite 成立），就直接执行
+  `OverviewCommandHelper` 的 `TOGGLE`（= 最近任务键 / `KEYCODE_APP_SWITCH` 那条路）并停掉本帧
+  后续处理：不启动交互式 recents 动画、不把位移喂给手势 handler，手指停在哪都不影响结果（实测
+  400 px 的短上滑也直接完整进入最近任务）。斜向/水平 swipe（夹角 ≤ 15°）、触控板手势，以及默认
+  模式（home == overview）行为全部不变；从**应用**上滑的跟手动画回归验证无变化。详见 §11。
 * **版本**：`module.prop` 的 `version=v1.2.2`、`versionCode=5`，发布 zip 为
   `dist/AxionRecents-v1.2.2.zip`。
 

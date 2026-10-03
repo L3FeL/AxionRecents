@@ -52,6 +52,16 @@ if (-not (Test-Path $helperPropSrc)) {
 }
 Copy-Item $helperPropSrc (Join-Path $stage 'helper.prop') -Force
 
+# helper/lspd-fix.jar: the dex service.sh runs through app_process to repair the APK path LSPosed
+# cached for the bridge (sources in helper/lspd-fix/, built by tools/build-lspd-fix.ps1). Without it
+# a bridge update leaves C-lite dead until the user toggles the module in LSPosed by hand.
+$lspdFix = Join-Path $root 'helper/lspd-fix.jar'
+if (-not (Test-Path $lspdFix)) {
+    throw "helper/lspd-fix.jar is missing - run tools/build-lspd-fix.ps1 first (service.sh repairs the LSPosed cache with it)"
+}
+New-Item -ItemType Directory -Path (Join-Path $stage 'helper') -Force | Out-Null
+Copy-Item $lspdFix (Join-Path $stage 'helper/lspd-fix.jar') -Force
+
 # payload/: what the scripts stage into the tmpfs mirrors at boot.
 Get-ChildItem (Join-Path $root 'payload') -File | ForEach-Object {
     Copy-Item $_.FullName (Join-Path $stage 'payload') -Force
@@ -104,6 +114,7 @@ try {
     if (-not $rro) { throw 'system/product/overlay/AxionRecentsOverlay.apk missing from the zip' }
     if ($rro.Length -ne 8339) { throw "RRO is $($rro.Length) bytes, post-fs-data.sh expects 8339" }
     foreach ($need in 'module.prop', 'helper.prop', 'customize.sh', 'post-fs-data.sh', 'service.sh', 'boot-completed.sh',
+                      'helper/lspd-fix.jar',
                       'payload/AxionLauncher3.apk', 'payload/AxionRecentsOverlay.apk',
                       'payload/privapp-permissions-com.android.launcher3.xml',
                       'extras/motodesktop-helper.apk', 'extras/C-LITE.md') {
